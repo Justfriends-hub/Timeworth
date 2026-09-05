@@ -7,7 +7,7 @@ import { SyncStatusBadge } from './components/SyncStatusBadge';
 import { Smartphone, Monitor, Layout, Clock, Sparkles } from 'lucide-react';
 
 function MainApp() {
-  const { deviceMode, setDeviceMode, activeView, profile, isLoading } = useApp();
+  const { deviceMode, setDeviceMode, profile, isLoading } = useApp();
   const [mobileFramed, setMobileFramed] = useState(false);
 
   // Initial loader while state is being hydrated
@@ -25,9 +25,11 @@ function MainApp() {
     );
   }
 
-  // Order: Sign Up -> Onboarding -> Dashboard
-  // Onboarding runs once per new account, before the user ever sees the real dashboard
-  if (!profile.onboardingCompleted || activeView === 'onboarding') {
+  // FIX: Only gate on profile.onboardingCompleted. The previous `|| activeView === 'onboarding'` caused a bounce:
+  // after completeOnboarding set dashboard, the 10s poll could return stale memory (Vercel serverless) and
+  // the AppContext effect would flip activeView back to 'onboarding', throwing user back to signup.
+  // Now the source of truth is the persisted profile (+ localStorage flag). activeView is for in-app nav only.
+  if (!profile.onboardingCompleted) {
     return (
       <div className="min-h-screen bg-slate-100 flex flex-col">
         <OnboardingFlow />

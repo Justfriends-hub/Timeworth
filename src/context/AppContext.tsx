@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { AppDataPayload, AppView, BankAccount, Category, Debtor, ExpenseEntry, Goal, IncomeEntry, UserProfile } from '../types';
 import { initialDataPayload } from '../data/defaultData';
 import { calculateHourlyRate } from '../utils/timeConversion';
@@ -49,8 +49,34 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
+const ONBOARDING_KEY = 'timeworth_onboarding_completed';
+const ONBOARDING_DATA_KEY = 'timeworth_onboarding_payload';
+
+function getLocalOnboardingFlag(): boolean {
+  try { return localStorage.getItem(ONBOARDING_KEY) === 'true'; } catch { return false; }
+}
+function setLocalOnboardingFlag(v: boolean) {
+  try {
+    if (v) localStorage.setItem(ONBOARDING_KEY, 'true');
+    else localStorage.removeItem(ONBOARDING_KEY);
+  } catch {}
+}
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [data, setData] = useState<AppDataPayload>(initialDataPayload);
+  const [data, setData] = useState<AppDataPayload>(() => {
+    // Hydrate from localStorage optimistic payload if present (prevents flash of signup after refresh)
+    try {
+      const raw = localStorage.getItem(ONBOARDING_DATA_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as AppDataPayload;
+        if (parsed?.profile?.onboardingCompleted) return parsed;
+      }
+      if (getLocalOnboardingFlag()) {
+        return { ...initialDataPayload, profile: { ...initialDataPayload.profile, onboardingCompleted: true, name: localStorage.getItem('timeworth_name') || initialDataPayload.profile.name } } as AppDataPayload;
+      }
+    } catch {}
+    return initialDataPayload;
+  });
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
@@ -61,7 +87,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
   const [deviceMode, setDeviceMode] = useState<'mobile' | 'desktop' | 'responsive'>('responsive');
 
-  // Fetch from REST API
+  // Ref to suppress the "bounce back to onboarding" after a successful completion
+  const onboardingJustCompletedRef = useRef(false);
+  const initialCheckDoneRef = useRef(false);
+
+  // Fetch from REST API — merges with local onboarding flag to prevent Vercel serverless bounce
   const fetchData = useCallback(async (isBackground = false) => {
     if (!isBackground) setIsSyncing(true);
     try {
@@ -70,9 +100,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const payload: AppDataPayload = await res.json();
         if (!payload.bankAccounts) payload.bankAccounts = [];
         if (!payload.debtors) payload.debtors = [];
+
+        const localFlag = getLocalOnboardingFlag();
+        // Critical fix: never downgrade onboardingCompleted from true -> false due to stale server/memory
+        if (localFlag && !payload.profile.onboardingCompleted) {
+          payload.profile.onboardingCompleted = true;
+        }
+        // If we just completed onboarding this session, server may be stale (cold lambda) — keep local wins for 30s
+        if (onboardingJustCompletedRef.current && !payload.profile.onboardingCompleted) {
+          payload.profile.onboardingCompleted = true;
+        }
+
         setData(payload);
         setLastSyncedAt(new Date());
         setSyncCount(prev => prev + 1);
+
+        // If server now agrees onboarding is true, clear the just-completed suppression after a grace period
+        if (payload.profile.onboardingCompleted && onboardingJustCompletedRef.current) {
+          setTimeout(() => { onboardingJustCompletedRef.current = false; }, 5000);
+        }
       }
     } catch (err) {
       console.warn('REST API fetch error, using current state:', err);
@@ -82,20 +128,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, []);
 
-  // Poll REST API every 10 seconds
+  // Poll REST API every 10 seconds — skipped for 30s after onboarding to avoid revert race
   useEffect(() => {
     fetchData(false);
-
     const interval = setInterval(() => {
+      if (onboardingJustCompletedRef.current) return;
       fetchData(true);
     }, 10000);
-
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  // If onboarding is not completed, auto-route to onboarding
+  // Initial auto-route: only once, and respects localStorage flag
   useEffect(() => {
-    if (!isLoading && !data.profile.onboardingCompleted) {
+    if (isLoading) return;
+    if (initialCheckDoneRef.current) return;
+    // If local flag says onboarding done, ensure dashboard even if server lagged
+    if (getLocalOnboardingFlag() && !data.profile.onboardingCompleted) {
+      setData(prev => ({ ...prev, profile: { ...prev.profile, onboardingCompleted: true } }));
+      setActiveView('dashboard');
+      initialCheckDoneRef.current = true;
+      return;
+    }
+    if (!data.profile.onboardingCompleted) {
+      setActiveView('onboarding');
+    } else {
+      // already completed — ensure not stuck on onboarding
+      setActiveView(prev => prev === 'onboarding' ? 'dashboard' : prev);
+    }
+    initialCheckDoneRef.current = true;
+  }, [isLoading, data.profile.onboardingCompleted]);
+
+  // Follow-up: if onboarding becomes false after it was true and we just completed, suppress bounce
+  useEffect(() => {
+    if (!isLoading && !data.profile.onboardingCompleted && onboardingJustCompletedRef.current) {
+      // Re-assert completed from local flag
+      setData(prev => ({ ...prev, profile: { ...prev.profile, onboardingCompleted: true } }));
+      setActiveView('dashboard');
+    } else if (!isLoading && !data.profile.onboardingCompleted && !onboardingJustCompletedRef.current && !initialCheckDoneRef.current) {
       setActiveView('onboarding');
     }
   }, [isLoading, data.profile.onboardingCompleted]);
@@ -473,6 +542,39 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const completeOnboarding = async (onboardingData: any) => {
     setIsLoading(true);
+    // Optimistic local update + persist flag immediately so UI never bounces back to signup
+    const optimisticProfile: Partial<UserProfile> = {
+      name: onboardingData?.profile?.name || data.profile.name || 'User',
+      currency: onboardingData?.profile?.currency || 'NGN',
+      currencySymbol: onboardingData?.profile?.currencySymbol || '₦',
+      monthlyIncome: Number(onboardingData?.profile?.monthlyIncome || 0),
+      workDaysPerWeek: Number(onboardingData?.profile?.workDaysPerWeek || 5),
+      workHoursPerDay: Number(onboardingData?.profile?.workHoursPerDay || 8),
+      onboardingCompleted: true,
+    };
+    const { hourlyRate, dailyRate } = calculateHourlyRate(
+      optimisticProfile.monthlyIncome as number,
+      optimisticProfile.workDaysPerWeek as number,
+      optimisticProfile.workHoursPerDay as number
+    );
+    const optimisticPayload: AppDataPayload = {
+      ...data,
+      profile: { ...data.profile, ...optimisticProfile, hourlyRate, dailyRate, onboardingCompleted: true },
+      lastUpdated: new Date().toISOString(),
+    };
+    // Seed catch-up/banks/debtors optimistically for instant dashboard
+    try {
+      // We keep full server response as source of truth, but optimistic keeps UI from flashing signup
+      setData(optimisticPayload);
+      setLocalOnboardingFlag(true);
+      try {
+        localStorage.setItem(ONBOARDING_DATA_KEY, JSON.stringify(optimisticPayload));
+        if (optimisticProfile.name) localStorage.setItem('timeworth_name', optimisticProfile.name as string);
+      } catch {}
+      onboardingJustCompletedRef.current = true;
+      setActiveView('dashboard');
+    } catch {}
+
     try {
       const res = await fetch('/api/onboarding', {
         method: 'POST',
@@ -482,22 +584,35 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (res.ok) {
         const result = await res.json();
         if (result.store) {
+          // Server is authoritative — but never accept a downgrade to onboardingCompleted=false
+          if (!result.store.profile.onboardingCompleted) result.store.profile.onboardingCompleted = true;
           setData(result.store);
+          try { localStorage.setItem(ONBOARDING_DATA_KEY, JSON.stringify(result.store)); } catch {}
         } else {
           await fetchData(false);
         }
+      } else {
+        console.warn('Onboarding POST failed:', res.status);
       }
       setActiveView('dashboard');
     } catch (e) {
       console.error('Failed to complete onboarding:', e);
+      // Keep optimistic — user stays on dashboard even if POST failed (demo mode fallback)
+      setActiveView('dashboard');
     } finally {
       setIsLoading(false);
+      // Keep suppression for 60s to survive Vercel cold-lambda stale reads
+      setTimeout(() => { onboardingJustCompletedRef.current = false; }, 60000);
     }
   };
 
   const resetData = async () => {
     setIsLoading(true);
     try {
+      setLocalOnboardingFlag(false);
+      try { localStorage.removeItem(ONBOARDING_DATA_KEY); localStorage.removeItem('timeworth_name'); } catch {}
+      onboardingJustCompletedRef.current = false;
+      initialCheckDoneRef.current = false;
       await fetch('/api/reset', { method: 'POST' });
       await fetchData(false);
       setActiveView('onboarding');

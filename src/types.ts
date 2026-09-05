@@ -102,6 +102,7 @@ export interface AppDataPayload {
 export type AppView = 
   | 'dashboard'
   | 'banks'
+  | 'bank-accounts'
   | 'debtors'
   | 'categories'
   | 'category-detail'
