@@ -3,15 +3,19 @@ import { AppProvider, useApp } from './context/AppContext';
 import { DesktopMollyLayout } from './components/DesktopMollyLayout';
 import { MobileScaffold } from './components/MobileScaffold';
 import { OnboardingFlow } from './components/OnboardingFlow';
+import { AuthView } from './components/AuthView';
 import { SyncStatusBadge } from './components/SyncStatusBadge';
-import { Smartphone, Monitor, Layout, Clock, Sparkles } from 'lucide-react';
+import { Smartphone, Monitor, Layout, Clock, LogOut } from 'lucide-react';
+import { getSupabaseBrowser } from './lib/supabase';
 
 function MainApp() {
-  const { deviceMode, setDeviceMode, profile, isLoading } = useApp();
+  const { deviceMode, setDeviceMode, profile, isLoading, isAuthLoading, user, signOut } = useApp();
   const [mobileFramed, setMobileFramed] = useState(false);
+  const supabase = getSupabaseBrowser();
+  const isSupabaseConfigured = !!supabase;
 
   // Initial loader while state is being hydrated
-  if (isLoading) {
+  if (isAuthLoading || isLoading) {
     return (
       <div className="min-h-screen bg-slate-900 text-white flex flex-col items-center justify-center p-6 text-center space-y-4">
         <div className="w-12 h-12 rounded-2xl bg-emerald-500 text-slate-950 font-black flex items-center justify-center animate-pulse">
@@ -19,16 +23,18 @@ function MainApp() {
         </div>
         <div className="space-y-1">
           <h2 className="text-lg font-bold">TimeWorth</h2>
-          <p className="text-xs text-slate-400">Loading your real numbers...</p>
+          <p className="text-xs text-slate-400">{isAuthLoading ? 'Checking session...' : 'Loading your real numbers...'}</p>
         </div>
       </div>
     );
   }
 
-  // FIX: Only gate on profile.onboardingCompleted. The previous `|| activeView === 'onboarding'` caused a bounce:
-  // after completeOnboarding set dashboard, the 10s poll could return stale memory (Vercel serverless) and
-  // the AppContext effect would flip activeView back to 'onboarding', throwing user back to signup.
-  // Now the source of truth is the persisted profile (+ localStorage flag). activeView is for in-app nav only.
+  // 1) If Supabase is configured and no session -> show login
+  if (isSupabaseConfigured && !user) {
+    return <AuthView />;
+  }
+
+  // 2) Logged in (or demo mode) but onboarding not done -> onboarding
   if (!profile.onboardingCompleted) {
     return (
       <div className="min-h-screen bg-slate-100 flex flex-col">
@@ -114,6 +120,15 @@ function MainApp() {
           <div className="hidden sm:block pl-2 border-l border-slate-700">
             <SyncStatusBadge compact />
           </div>
+
+          {isSupabaseConfigured && user && (
+            <div className="flex items-center gap-2 pl-2 border-l border-slate-700">
+              <span className="hidden lg:inline text-[11px] text-slate-400 max-w-[160px] truncate">{user.email}</span>
+              <button onClick={signOut} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-700 text-[11px] font-bold">
+                <LogOut className="w-3.5 h-3.5" /> <span className="hidden sm:inline">Logout</span>
+              </button>
+            </div>
+          )}
         </div>
       </header>
 

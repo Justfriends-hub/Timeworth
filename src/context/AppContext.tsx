@@ -2,6 +2,8 @@ import React, { createContext, useContext, useEffect, useState, useCallback, use
 import { AppDataPayload, AppView, BankAccount, Category, Debtor, ExpenseEntry, Goal, IncomeEntry, UserProfile } from '../types';
 import { initialDataPayload } from '../data/defaultData';
 import { calculateHourlyRate } from '../utils/timeConversion';
+import { getSupabaseBrowser } from '../lib/supabase';
+import type { User, Session } from '@supabase/supabase-js';
 
 interface AppContextType {
   data: AppDataPayload;
@@ -12,6 +14,9 @@ interface AppContextType {
   goals: Goal[];
   bankAccounts: BankAccount[];
   debtors: Debtor[];
+  user: User | null;
+  session: Session | null;
+  isAuthLoading: boolean;
   isLoading: boolean;
   isSyncing: boolean;
   lastSyncedAt: Date | null;
@@ -45,6 +50,7 @@ interface AppContextType {
   completeOnboarding: (onboardingData: any) => Promise<void>;
   resetData: () => Promise<void>;
   manualRefresh: () => Promise<void>;
+  signOut: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -62,9 +68,15 @@ function setLocalOnboardingFlag(v: boolean) {
   } catch {}
 }
 
+function getAuthHeaders(session: Session | null): Record<string,string> {
+  const h: Record<string,string> = { 'Content-Type': 'application/json' };
+  if (session?.user?.id) h['x-user-id'] = session.user.id;
+  if (session?.access_token) h['Authorization'] = `Bearer ${session.access_token}`;
+  return h;
+}
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [data, setData] = useState<AppDataPayload>(() => {
-    // Hydrate from localStorage optimistic payload if present (prevents flash of signup after refresh)
     try {
       const raw = localStorage.getItem(ONBOARDING_DATA_KEY);
       if (raw) {
@@ -87,26 +99,54 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
   const [deviceMode, setDeviceMode] = useState<'mobile' | 'desktop' | 'responsive'>('responsive');
 
-  // Ref to suppress the "bounce back to onboarding" after a successful completion
+  // Auth state
+  const [user, setUser] = useState<User | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const supabase = getSupabaseBrowser();
+
   const onboardingJustCompletedRef = useRef(false);
   const initialCheckDoneRef = useRef(false);
+
+  // Auth listener
+  useEffect(() => {
+    if (!supabase) {
+      // No supabase configured -> stay in demo mode, no auth required
+      setIsAuthLoading(false);
+      return;
+    }
+    let mounted = true;
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      if (!mounted) return;
+      setSession(s);
+      setUser(s?.user ?? null);
+      setIsAuthLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s);
+      setUser(s?.user ?? null);
+      setIsAuthLoading(false);
+    });
+    return () => { mounted = false; subscription.unsubscribe(); };
+  }, []); // supabase is singleton stable, don't re-sub
 
   // Fetch from REST API — merges with local onboarding flag to prevent Vercel serverless bounce
   const fetchData = useCallback(async (isBackground = false) => {
     if (!isBackground) setIsSyncing(true);
     try {
-      const res = await fetch('/api/data');
+      const headers: Record<string,string> = {};
+      if (session?.user?.id) headers['x-user-id'] = session.user.id;
+      if (session?.access_token) headers['Authorization'] = `Bearer ${session.access_token}`;
+      const res = await fetch('/api/data', { headers });
       if (res.ok) {
         const payload: AppDataPayload = await res.json();
         if (!payload.bankAccounts) payload.bankAccounts = [];
         if (!payload.debtors) payload.debtors = [];
 
         const localFlag = getLocalOnboardingFlag();
-        // Critical fix: never downgrade onboardingCompleted from true -> false due to stale server/memory
         if (localFlag && !payload.profile.onboardingCompleted) {
           payload.profile.onboardingCompleted = true;
         }
-        // If we just completed onboarding this session, server may be stale (cold lambda) — keep local wins for 30s
         if (onboardingJustCompletedRef.current && !payload.profile.onboardingCompleted) {
           payload.profile.onboardingCompleted = true;
         }
@@ -115,7 +155,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setLastSyncedAt(new Date());
         setSyncCount(prev => prev + 1);
 
-        // If server now agrees onboarding is true, clear the just-completed suppression after a grace period
         if (payload.profile.onboardingCompleted && onboardingJustCompletedRef.current) {
           setTimeout(() => { onboardingJustCompletedRef.current = false; }, 5000);
         }
@@ -126,23 +165,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setIsLoading(false);
       setIsSyncing(false);
     }
-  }, []);
+  }, [session]);
 
   // Poll REST API every 10 seconds — skipped for 30s after onboarding to avoid revert race
+  // Only poll when we have auth context resolved
   useEffect(() => {
+    if (isAuthLoading) return;
+    // If supabase configured but no user, don't fetch (show login)
+    if (supabase && !user) {
+      setIsLoading(false);
+      return;
+    }
     fetchData(false);
     const interval = setInterval(() => {
       if (onboardingJustCompletedRef.current) return;
       fetchData(true);
     }, 10000);
     return () => clearInterval(interval);
-  }, [fetchData]);
+  }, [fetchData, isAuthLoading, user, supabase]);
 
   // Initial auto-route: only once, and respects localStorage flag
   useEffect(() => {
-    if (isLoading) return;
+    if (isLoading || isAuthLoading) return;
     if (initialCheckDoneRef.current) return;
-    // If local flag says onboarding done, ensure dashboard even if server lagged
     if (getLocalOnboardingFlag() && !data.profile.onboardingCompleted) {
       setData(prev => ({ ...prev, profile: { ...prev.profile, onboardingCompleted: true } }));
       setActiveView('dashboard');
@@ -152,22 +197,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!data.profile.onboardingCompleted) {
       setActiveView('onboarding');
     } else {
-      // already completed — ensure not stuck on onboarding
       setActiveView(prev => prev === 'onboarding' ? 'dashboard' : prev);
     }
     initialCheckDoneRef.current = true;
-  }, [isLoading, data.profile.onboardingCompleted]);
+  }, [isLoading, isAuthLoading, data.profile.onboardingCompleted]);
 
   // Follow-up: if onboarding becomes false after it was true and we just completed, suppress bounce
   useEffect(() => {
-    if (!isLoading && !data.profile.onboardingCompleted && onboardingJustCompletedRef.current) {
-      // Re-assert completed from local flag
+    if (!isLoading && !isAuthLoading && !data.profile.onboardingCompleted && onboardingJustCompletedRef.current) {
       setData(prev => ({ ...prev, profile: { ...prev.profile, onboardingCompleted: true } }));
       setActiveView('dashboard');
-    } else if (!isLoading && !data.profile.onboardingCompleted && !onboardingJustCompletedRef.current && !initialCheckDoneRef.current) {
+    } else if (!isLoading && !isAuthLoading && !data.profile.onboardingCompleted && !onboardingJustCompletedRef.current && !initialCheckDoneRef.current) {
       setActiveView('onboarding');
     }
-  }, [isLoading, data.profile.onboardingCompleted]);
+  }, [isLoading, isAuthLoading, data.profile.onboardingCompleted]);
+
+  const authHeaders = () => getAuthHeaders(session);
 
   // Mutations
   const addExpense = async (expense: { amount: number; title: string; categoryId: string; note?: string; dateTime?: string }) => {
@@ -181,8 +226,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       dateTime: expense.dateTime || new Date().toISOString(),
       note: expense.note,
     };
-
-    // Optimistic UI update
     setData(prev => {
       const updatedCategories = prev.categories.map(c => 
         c.id === expense.categoryId ? { ...c, spent: c.spent + numAmount } : c
@@ -194,11 +237,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         lastUpdated: new Date().toISOString(),
       };
     });
-
     try {
       await fetch('/api/expenses', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(expense),
       });
       fetchData(true);
@@ -210,8 +252,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const deleteExpense = async (id: string) => {
     const expenseToDelete = data.expenses.find(e => e.id === id);
     if (!expenseToDelete) return;
-
-    // Optimistic update
     setData(prev => ({
       ...prev,
       categories: prev.categories.map(c =>
@@ -220,9 +260,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       expenses: prev.expenses.filter(e => e.id !== id),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
-      await fetch(`/api/expenses/${id}`, { method: 'DELETE' });
+      await fetch(`/api/expenses/${id}`, { method: 'DELETE', headers: authHeaders() });
       fetchData(true);
     } catch (e) {
       console.error('Failed to delete expense:', e);
@@ -240,17 +279,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       dateTime: income.dateTime || new Date().toISOString(),
       note: income.note,
     };
-
     setData(prev => ({
       ...prev,
       income: [newEntry, ...prev.income],
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch('/api/income', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(income),
       });
       fetchData(true);
@@ -265,9 +302,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       income: prev.income.filter(i => i.id !== id),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
-      await fetch(`/api/income/${id}`, { method: 'DELETE' });
+      await fetch(`/api/income/${id}`, { method: 'DELETE', headers: authHeaders() });
       fetchData(true);
     } catch (e) {
       console.error('Failed to delete income:', e);
@@ -279,9 +315,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const monthlyIncome = updates.monthlyIncome !== undefined ? Number(updates.monthlyIncome) : current.monthlyIncome;
     const workDaysPerWeek = updates.workDaysPerWeek !== undefined ? Number(updates.workDaysPerWeek) : current.workDaysPerWeek;
     const workHoursPerDay = updates.workHoursPerDay !== undefined ? Number(updates.workHoursPerDay) : current.workHoursPerDay;
-
     const { hourlyRate, dailyRate } = calculateHourlyRate(monthlyIncome, workDaysPerWeek, workHoursPerDay);
-
     const newProfile: UserProfile = {
       ...current,
       ...updates,
@@ -291,17 +325,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       hourlyRate,
       dailyRate,
     };
-
     setData(prev => ({
       ...prev,
       profile: newProfile,
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch('/api/profile', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(updates),
       });
       fetchData(true);
@@ -316,17 +348,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       id: `goal-${Date.now()}`,
       createdAt: new Date().toISOString().split('T')[0],
     };
-
     setData(prev => ({
       ...prev,
       goals: [...prev.goals, newGoal],
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch('/api/goals', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(goal),
       });
       fetchData(true);
@@ -343,11 +373,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch(`/api/goals/${id}`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ addAmount: amount }),
       });
       fetchData(true);
@@ -362,9 +391,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       goals: prev.goals.filter(g => g.id !== id),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
-      await fetch(`/api/goals/${id}`, { method: 'DELETE' });
+      await fetch(`/api/goals/${id}`, { method: 'DELETE', headers: authHeaders() });
       fetchData(true);
     } catch (e) {
       console.error('Failed to delete goal:', e);
@@ -379,11 +407,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch(`/api/categories/${id}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ monthlyBudget }),
       });
       fetchData(true);
@@ -400,17 +427,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       balance: Number(bank.balance || 0),
       lastUpdated: new Date().toISOString(),
     };
-
     setData(prev => ({
       ...prev,
       bankAccounts: [...(prev.bankAccounts || []), tempBank],
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch('/api/banks', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(bank),
       });
       fetchData(true);
@@ -427,11 +452,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch(`/api/banks/${id}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(bank),
       });
       fetchData(true);
@@ -446,9 +470,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       bankAccounts: (prev.bankAccounts || []).filter(b => b.id !== id),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
-      await fetch(`/api/banks/${id}`, { method: 'DELETE' });
+      await fetch(`/api/banks/${id}`, { method: 'DELETE', headers: authHeaders() });
       fetchData(true);
     } catch (e) {
       console.error('Failed to delete bank account:', e);
@@ -466,17 +489,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       note: debtor.note?.trim() || '',
       createdAt: new Date().toISOString(),
     };
-
     setData(prev => ({
       ...prev,
       debtors: [tempDebtor, ...(prev.debtors || [])],
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch('/api/debtors', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(debtor),
       });
       fetchData(true);
@@ -493,11 +514,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch(`/api/debtors/${id}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(debtorUpdates),
       });
       fetchData(true);
@@ -514,10 +534,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
       await fetch(`/api/debtors/${id}/mark-paid`, {
         method: 'PATCH',
+        headers: authHeaders(),
       });
       fetchData(true);
     } catch (e) {
@@ -531,9 +551,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       debtors: (prev.debtors || []).filter(d => d.id !== id),
       lastUpdated: new Date().toISOString(),
     }));
-
     try {
-      await fetch(`/api/debtors/${id}`, { method: 'DELETE' });
+      await fetch(`/api/debtors/${id}`, { method: 'DELETE', headers: authHeaders() });
       fetchData(true);
     } catch (e) {
       console.error('Failed to delete debtor:', e);
@@ -542,7 +561,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const completeOnboarding = async (onboardingData: any) => {
     setIsLoading(true);
-    // Optimistic local update + persist flag immediately so UI never bounces back to signup
     const optimisticProfile: Partial<UserProfile> = {
       name: onboardingData?.profile?.name || data.profile.name || 'User',
       currency: onboardingData?.profile?.currency || 'NGN',
@@ -562,9 +580,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       profile: { ...data.profile, ...optimisticProfile, hourlyRate, dailyRate, onboardingCompleted: true },
       lastUpdated: new Date().toISOString(),
     };
-    // Seed catch-up/banks/debtors optimistically for instant dashboard
     try {
-      // We keep full server response as source of truth, but optimistic keeps UI from flashing signup
       setData(optimisticPayload);
       setLocalOnboardingFlag(true);
       try {
@@ -574,17 +590,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       onboardingJustCompletedRef.current = true;
       setActiveView('dashboard');
     } catch {}
-
     try {
       const res = await fetch('/api/onboarding', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(onboardingData),
       });
       if (res.ok) {
         const result = await res.json();
         if (result.store) {
-          // Server is authoritative — but never accept a downgrade to onboardingCompleted=false
           if (!result.store.profile.onboardingCompleted) result.store.profile.onboardingCompleted = true;
           setData(result.store);
           try { localStorage.setItem(ONBOARDING_DATA_KEY, JSON.stringify(result.store)); } catch {}
@@ -597,11 +611,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setActiveView('dashboard');
     } catch (e) {
       console.error('Failed to complete onboarding:', e);
-      // Keep optimistic — user stays on dashboard even if POST failed (demo mode fallback)
       setActiveView('dashboard');
     } finally {
       setIsLoading(false);
-      // Keep suppression for 60s to survive Vercel cold-lambda stale reads
       setTimeout(() => { onboardingJustCompletedRef.current = false; }, 60000);
     }
   };
@@ -613,7 +625,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       try { localStorage.removeItem(ONBOARDING_DATA_KEY); localStorage.removeItem('timeworth_name'); } catch {}
       onboardingJustCompletedRef.current = false;
       initialCheckDoneRef.current = false;
-      await fetch('/api/reset', { method: 'POST' });
+      await fetch('/api/reset', { method: 'POST', headers: authHeaders() });
       await fetchData(false);
       setActiveView('onboarding');
     } catch (e) {
@@ -627,6 +639,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     await fetchData(false);
   };
 
+  const signOut = async () => {
+    try {
+      if (supabase) await supabase.auth.signOut();
+    } catch {}
+    setUser(null);
+    setSession(null);
+    setLocalOnboardingFlag(false);
+    try { localStorage.removeItem(ONBOARDING_DATA_KEY); localStorage.removeItem('timeworth_name'); } catch {}
+    initialCheckDoneRef.current = false;
+    setData(initialDataPayload);
+    setActiveView('onboarding');
+  };
+
   return (
     <AppContext.Provider
       value={{
@@ -638,6 +663,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         goals: data.goals,
         bankAccounts: data.bankAccounts || [],
         debtors: data.debtors || [],
+        user,
+        session,
+        isAuthLoading,
         isLoading,
         isSyncing,
         lastSyncedAt,
@@ -669,6 +697,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         completeOnboarding,
         resetData,
         manualRefresh,
+        signOut,
       }}
     >
       {children}

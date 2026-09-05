@@ -1,10 +1,12 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { calculateHourlyRate, formatCurrency } from '../utils/timeConversion';
-import { ArrowLeft, Check, RotateCcw, Clock, Calculator, Sliders, Shield, Download, Upload } from 'lucide-react';
+import { ArrowLeft, Check, RotateCcw, Clock, Calculator, Sliders, Shield, Download, Upload, LogOut } from 'lucide-react';
+import { getSupabaseBrowser } from '../lib/supabase';
 
 export const SettingsView: React.FC = () => {
-  const { profile, updateProfile, resetData, setActiveView } = useApp();
+  const { profile, updateProfile, resetData, setActiveView, user, signOut } = useApp();
+  const supabase = getSupabaseBrowser();
 
   const [monthlyIncome, setMonthlyIncome] = useState(profile.monthlyIncome.toString());
   const [workDays, setWorkDays] = useState(profile.workDaysPerWeek);
@@ -253,6 +255,29 @@ export const SettingsView: React.FC = () => {
           <span>Reset</span>
         </button>
       </div>
+
+      {/* Auth Card */}
+      {supabase && user ? (
+        <div className="bg-white rounded-3xl p-5 border border-slate-200 space-y-3">
+          <h4 className="text-xs font-bold text-slate-800 flex items-center gap-2"><Shield className="w-4 h-4 text-emerald-600" /> Account</h4>
+          <div className="text-xs">
+            <div className="text-slate-500">Logged in as</div>
+            <div className="font-bold text-slate-900 break-all">{user.email}</div>
+            <div className="text-[11px] text-slate-400 font-mono break-all">uid: {user.id}</div>
+          </div>
+          <button
+            onClick={signOut}
+            className="w-full inline-flex items-center justify-center gap-2 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-2xl text-sm"
+          >
+            <LogOut className="w-4 h-4" /> Log out
+          </button>
+        </div>
+      ) : !supabase ? (
+        <div className="bg-amber-50 rounded-3xl p-5 border border-amber-200">
+          <h4 className="text-xs font-bold text-amber-800">Demo mode (no Supabase)</h4>
+          <p className="text-[11px] text-amber-700 mt-1">Set VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY to enable real login + RLS. Data currently lives in memory and resets on restart.</p>
+        </div>
+      ) : null}
     </div>
   );
 };

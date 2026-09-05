@@ -49,14 +49,14 @@ interface ItemizedEntry {
 }
 
 export const OnboardingFlow: React.FC = () => {
-  const { categories, completeOnboarding } = useApp();
+  const { categories, completeOnboarding, user } = useApp();
 
   // Phase: 'signup' | 0 | 1 | 2 | 3 | 4 | 5 | 6
-  const [currentStep, setCurrentStep] = useState<number | 'signup'>('signup');
+  const [currentStep, setCurrentStep] = useState<number | 'signup'>(() => (user ? 0 : 'signup'));
 
   // Sign Up Form State
-  const [signupName, setSignupName] = useState('');
-  const [signupEmail, setSignupEmail] = useState('');
+  const [signupName, setSignupName] = useState(user?.user_metadata?.name || user?.email?.split('@')[0] || '');
+  const [signupEmail, setSignupEmail] = useState(user?.email || '');
   const [signupPassword, setSignupPassword] = useState('');
 
   // Step 0: Slide index (0, 1, 2)
