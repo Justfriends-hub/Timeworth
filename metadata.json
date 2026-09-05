@@ -1,0 +1,6 @@
+{
+  "name": "TimeWorth",
+  "description": "A budgeting app that converts every naira spent or earned into time worked.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
