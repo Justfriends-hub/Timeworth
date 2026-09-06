@@ -51,31 +51,9 @@ export const SettingsView: React.FC = () => {
     } catch { return null; }
   };
 
+  // LOCAL COMMENTED OUT - AI ONLY: Settings localParseFallback disabled
   const localParseFallback = (file: File, fileData: string): any[] => {
-    const name = file.name.toLowerCase();
-    const isCsv = name.endsWith('.csv');
-    const isExcel = name.endsWith('.xls') || name.endsWith('.xlsx');
-    try {
-      if (isCsv) {
-        let text: string;
-        if (fileData.startsWith('data:')) { const c=fileData.indexOf(','); const b=fileData.slice(c+1).replace(/\s/g,''); try{ const d=safeAtob(b); text=d||fileData; }catch{ text=fileData; } } else text=fileData;
-        const lines=text.split(/\r?\n/).filter((l:string)=>l.trim().length>0);
-        const out:any[]=[];
-        for(let i=1;i<lines.length;i++){ const cols=lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((c:string)=>c.replace(/^"|"$/g,'').trim()); if(cols.length<3) continue; const v=parseFloat(cols[2].replace(/[^0-9.-]/g,'')); if(isNaN(v)||v===0) continue; const abs=Math.abs(v); const d=new Date(cols[0]); const ds=!isNaN(d.getTime())?d.toISOString().split('T')[0]:new Date().toISOString().split('T')[0]; out.push({id:'set-csv-'+Date.now()+'-'+i,date:ds,amount:abs,description:(cols[1]||'Transaction').slice(0,60),type:v<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),confirmed:true}); }
-        return out;
-      }
-      if (isExcel && fileData.startsWith('data:')) {
-        const b64=fileData.slice(fileData.indexOf(',')+1).replace(/\s/g,'');
-        const _bytes=safeB64ToBytes(b64); if(!_bytes) return []; const buf=_bytes;
-        const wb=XLSX.read(buf,{type:'array'});
-        const sheet=wb.Sheets[wb.SheetNames[0]];
-        const rows:any[][]=XLSX.utils.sheet_to_json(sheet,{header:1,defval:''});
-        let hi=0; for(let i=0;i<Math.min(5,rows.length);i++){const j=rows[i].join(' ').toLowerCase(); if(j.includes('date')&&(j.includes('amount')||j.includes('debit')||j.includes('credit'))){hi=i;break;}}
-        const out:any[]=[];
-        for(let i=hi+1;i<rows.length;i++){const r=rows[i]; if(!r||r.length<2) continue; const dr=String(r[0]||'').trim(); const desc=String(r[1]||r[2]||'Transaction').trim(); let av:number|null=null; for(let c=2;c<Math.min(7,r.length);c++){const s=String(r[c]).replace(/[^0-9.-]/g,''); const n=parseFloat(s); if(!isNaN(n)&&n!==0&&Math.abs(n)>0.5){av=n;break;}} if(av===null||isNaN(av)||av===0) continue; const abs=Math.abs(av); let ds=new Date().toISOString().split('T')[0]; if(typeof r[0]==='number'&&r[0]>30000){const d=new Date((r[0]-25569)*86400*1000); if(!isNaN(d.getTime())) ds=d.toISOString().split('T')[0];} else{const d=new Date(dr); if(!isNaN(d.getTime())&&dr.length>=6) ds=d.toISOString().split('T')[0];} out.push({id:'set-xls-'+Date.now()+'-'+i,date:ds,amount:abs,description:desc.slice(0,60),type:av<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),confirmed:true});}
-        return out;
-      }
-    } catch(e){ console.warn('[settings localParse] failed',e); }
+    console.warn('[settings localParseFallback] disabled - AI-only mode');
     return [];
   };
 
@@ -97,19 +75,18 @@ export const SettingsView: React.FC = () => {
         const fileData = await readAsData(file);
         const res = await fetch('/api/gemini/parse-statement', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ fileData, mimeType: file.type||'text/plain', fileName: file.name, existingTransactions: all }) });
         let data:any;
-        try { const txt=await res.text(); data=txt?JSON.parse(txt):{}; } catch {
-          const local=localParseFallback(file,fileData);
-          if(local.length>0){ for(const tx of local){ const dup=all.some((ex:any)=>ex.date===tx.date&&Math.abs(ex.amount-tx.amount)<0.01&&ex.description===tx.description); if(!dup) all.push(tx); else all.push({...tx,isDuplicate:true,confirmed:false}); } setParseWarning('Processed locally in browser — all '+local.length+' rows kept (OpenRouter row-by-row fallback).'); continue; }
-          throw new Error('Could not process '+file.name+' ('+res.status+') — all rows will be carried via local retry.');
+        try { const txt=await res.text(); data=txt?JSON.parse(txt):{}; } catch (e:any) {
+          // LOCAL COMMENTED OUT - AI ONLY
+          // const local=localParseFallback(file,fileData);
+          // if(local.length>0){ ... }
+          throw new Error('AI parsing failed for '+file.name+' ('+res.status+') — OpenRouter did not return valid JSON. Local fallback is disabled (AI-only mode).');
         }
         if(data.warning) setParseWarning(data.warning);
         if(data.method) setParseWarning((p:string|null)=> (p?p+' | ':'') + 'AI method: '+data.method+' row-by-row');
         if(!res.ok){
           const msg=data.error||'Failed to parse '+file.name;
-          if(res.status===413||String(msg).toLowerCase().includes('too large')){
-            const local=localParseFallback(file,fileData);
-            if(local.length>0){ for(const tx of local){ const dup=all.some((ex:any)=>ex.date===tx.date&&Math.abs(ex.amount-tx.amount)<0.01&&ex.description===tx.description); if(!dup) all.push(tx); else all.push({...tx,isDuplicate:true,confirmed:false}); } setParseWarning('File processed locally — all '+local.length+' rows carried.'); continue; }
-          }
+          // LOCAL COMMENTED OUT - AI ONLY for 413/too large
+          // if(res.status===413||String(msg).toLowerCase().includes('too large')){ const local=localParseFallback... }
           throw new Error(msg + (data.warning?' — '+data.warning:''));
         }
         if(data.transactions && Array.isArray(data.transactions)){

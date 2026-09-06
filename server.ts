@@ -746,58 +746,61 @@ Return ONLY a valid JSON array — one object per row, in original order.`;
           return res.json({ success: true, transactions: enriched, method: 'openrouter-free', geminiAvailable, openrouter: true });
         }
       }
-      // If OpenRouter row-by-row AI failed for XLS, fall back to local XLS parse as LAST resort (keeps all rows, generic category)
-      if (isExcel && fileData.startsWith('data:')) {
-        try {
-          const commaIdxL2 = fileData.indexOf(',');
-          let b64L2 = commaIdxL2 !== -1 ? fileData.slice(commaIdxL2+1).replace(/\s/g,'') : '';
-          if (b64L2.length > 50) {
-            const bufferL2 = Buffer.from(b64L2, 'base64');
-            const wbL2 = XLSX.read(bufferL2, { type: 'buffer' });
-            const sheetL2 = wbL2.Sheets[wbL2.SheetNames[0]];
-            const rowsL2:any[][] = XLSX.utils.sheet_to_json(sheetL2, { header:1, defval:'' });
-            let headerIdxL2=0;
-            for(let i=0;i<Math.min(5,rowsL2.length);i++){const j=rowsL2[i].join(' ').toLowerCase();if(j.includes('date')&&(j.includes('amount')||j.includes('debit')||j.includes('credit'))){headerIdxL2=i;break;}}
-            const excelTxsL2:any[]=[];
-            for(let i=headerIdxL2+1;i<rowsL2.length;i++){const r=rowsL2[i];if(!r||r.length<2)continue;const dr=String(r[0]||'').trim();const desc=String(r[1]||r[2]||'Transaction').trim();let av:number|null=null;for(let c=2;c<Math.min(7,r.length);c++){const s=String(r[c]).replace(/[^0-9.-]/g,'');const n=parseFloat(s);if(!isNaN(n)&&n!==0&&Math.abs(n)>0.5){av=n;break;}}if(av===null||isNaN(av)||av===0)continue;const abs=Math.abs(av);let ds=new Date().toISOString().split('T')[0];if(typeof r[0]==='number'&&r[0]>30000){const d=new Date((r[0]-25569)*86400*1000);if(!isNaN(d.getTime()))ds=d.toISOString().split('T')[0];}else{const d=new Date(dr);if(!isNaN(d.getTime())&&dr.length>=6)ds=d.toISOString().split('T')[0];}excelTxsL2.push({id:`parsed-xls-fallback-${Date.now()}-${i}`,date:ds,amount:abs,description:desc.slice(0,60),type:av<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),isDuplicate:false,confirmed:true});}
-            if(excelTxsL2.length>0){
-              return res.json({ success:true, transactions:excelTxsL2, method:'local-xlsx-after-ai-failed', geminiAvailable, openrouter: !!getOpenRouterKey(), warning: 'AI row-by-row failed ('+ (getOpenRouterKey()?'OpenRouter did not return rows':'no OPENROUTER_API_KEY') +') — parsed locally after AI, categories are generic. Check server logs.' });
-            }
-          }
-        } catch(e:any){ console.warn('[xlsx fallback after AI failed]',e?.message); }
-      }
-      if (!isCsv && !isExcel && !geminiAvailable) {
-        return res.json({ success: true, transactions: [], method: 'no-gemini-no-csv', geminiAvailable: false, warning: 'AI is not configured (GEMINI_API_KEY missing). PDF/Image/XLS parsing needs Gemini for best results, but CSV and XLS are parsed locally. Add GEMINI_API_KEY in .env or Vercel env for better AI categorization.' });
-      }
-      let textContent = fileData;
-      if (fileData.startsWith('data:')) {
-        const commaIdx3 = fileData.indexOf(',');
-        if (commaIdx3 !== -1) {
-          const b64raw = fileData.slice(commaIdx3 + 1).replace(/\s/g,'');
-          if (b64raw) {
-            try { textContent = Buffer.from(b64raw, 'base64').toString('utf-8'); } catch { textContent = fileData; }
-          }
-        }
-      }
-      const lines = textContent.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
-      const fallbackTransactions: any[] = [];
-      for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((c: string) => c.replace(/^"|"$/g, '').trim());
-        if (cols.length >= 3) {
-          const dateStr = cols[0]; const desc = cols[1] || 'Transaction';
-          const amountRaw = cols[2] ? parseFloat(cols[2].replace(/[^0-9.-]/g, '')) : 0;
-          if (isNaN(amountRaw) || amountRaw === 0) continue;
-          const absAmt = Math.abs(amountRaw);
-          const parsedDate = new Date(dateStr);
-          const validDate = !isNaN(parsedDate.getTime());
-          const dateFormatted = validDate ? parsedDate.toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
-          fallbackTransactions.push({
-            id: `parsed-fb-${Date.now()}-${i}`, date: dateFormatted, amount: absAmt, description: desc,
-            type: amountRaw < 0 ? 'expense' : 'income', suggestedCategory: 'Groceries', month: dateFormatted.slice(0, 7), isDuplicate: false, confirmed: true,
-          });
-        }
-      }
-      return res.json({ success: true, transactions: fallbackTransactions, method: 'local-csv-fallback', geminiAvailable, warning: fallbackTransactions.length===0 && !isCsv ? 'Only CSV is supported without Gemini. For PDF/images, set GEMINI_API_KEY.' : undefined });
+      // LOCAL FALLBACK COMMENTED OUT - AI ONLY (per user request)
+      // if (isExcel && fileData.startsWith('data:')) {
+      //   try {
+      //     const commaIdxL2 = fileData.indexOf(',');
+      //     let b64L2 = commaIdxL2 !== -1 ? fileData.slice(commaIdxL2+1).replace(/\s/g,'') : '';
+      //     if (b64L2.length > 50) {
+      //       const bufferL2 = Buffer.from(b64L2, 'base64');
+      //       const wbL2 = XLSX.read(bufferL2, { type: 'buffer' });
+      //       const sheetL2 = wbL2.Sheets[wbL2.SheetNames[0]];
+      //       const rowsL2:any[][] = XLSX.utils.sheet_to_json(sheetL2, { header:1, defval:'' });
+      //       let headerIdxL2=0;
+      //       for(let i=0;i<Math.min(5,rowsL2.length);i++){const j=rowsL2[i].join(' ').toLowerCase();if(j.includes('date')&&(j.includes('amount')||j.includes('debit')||j.includes('credit'))){headerIdxL2=i;break;}}
+      //       const excelTxsL2:any[]=[];
+      //       for(let i=headerIdxL2+1;i<rowsL2.length;i++){const r=rowsL2[i];if(!r||r.length<2)continue;const dr=String(r[0]||'').trim();const desc=String(r[1]||r[2]||'Transaction').trim();let av:number|null=null;for(let c=2;c<Math.min(7,r.length);c++){const s=String(r[c]).replace(/[^0-9.-]/g,'');const n=parseFloat(s);if(!isNaN(n)&&n!==0&&Math.abs(n)>0.5){av=n;break;}}if(av===null||isNaN(av)||av===0)continue;const abs=Math.abs(av);let ds=new Date().toISOString().split('T')[0];if(typeof r[0]==='number'&&r[0]>30000){const d=new Date((r[0]-25569)*86400*1000);if(!isNaN(d.getTime()))ds=d.toISOString().split('T')[0];}else{const d=new Date(dr);if(!isNaN(d.getTime())&&dr.length>=6)ds=d.toISOString().split('T')[0];}excelTxsL2.push({id:`parsed-xls-fallback-${Date.now()}-${i}`,date:ds,amount:abs,description:desc.slice(0,60),type:av<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),isDuplicate:false,confirmed:true});}
+      //       if(excelTxsL2.length>0){
+      //         return res.json({ success:true, transactions:excelTxsL2, method:'local-xlsx-after-ai-failed', geminiAvailable, openrouter: !!getOpenRouterKey(), warning: 'AI row-by-row failed ('+ (getOpenRouterKey()?'OpenRouter did not return rows':'no OPENROUTER_API_KEY') +') — parsed locally after AI, categories are generic. Check server logs.' });
+      //       }
+      //     }
+      //   } catch(e:any){ console.warn('[xlsx fallback after AI failed]',e?.message); }
+      // }
+      // LOCAL CSV FALLBACK COMMENTED OUT - AI ONLY
+      // if (!isCsv && !isExcel && !geminiAvailable) {
+      //   return res.json({ success: true, transactions: [], method: 'no-gemini-no-csv', geminiAvailable: false, warning: 'AI is not configured (GEMINI_API_KEY missing). PDF/Image/XLS parsing needs Gemini for best results, but CSV and XLS are parsed locally. Add GEMINI_API_KEY in .env or Vercel env for better AI categorization.' });
+      // }
+      // let textContent = fileData;
+      // if (fileData.startsWith('data:')) {
+      //   const commaIdx3 = fileData.indexOf(',');
+      //   if (commaIdx3 !== -1) {
+      //     const b64raw = fileData.slice(commaIdx3 + 1).replace(/\s/g,'');
+      //     if (b64raw) {
+      //       try { textContent = Buffer.from(b64raw, 'base64').toString('utf-8'); } catch { textContent = fileData; }
+      //     }
+      //   }
+      // }
+      // const lines = textContent.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
+      // const fallbackTransactions: any[] = [];
+      // for (let i = 1; i < lines.length; i++) {
+      //   const cols = lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((c: string) => c.replace(/^"|"$/g, '').trim());
+      //   if (cols.length >= 3) {
+      //     const dateStr = cols[0]; const desc = cols[1] || 'Transaction';
+      //     const amountRaw = cols[2] ? parseFloat(cols[2].replace(/[^0-9.-]/g, '')) : 0;
+      //     if (isNaN(amountRaw) || amountRaw === 0) continue;
+      //     const absAmt = Math.abs(amountRaw);
+      //     const parsedDate = new Date(dateStr);
+      //     const validDate = !isNaN(parsedDate.getTime());
+      //     const dateFormatted = validDate ? parsedDate.toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+      //     fallbackTransactions.push({
+      //       id: `parsed-fb-${Date.now()}-${i}`, date: dateFormatted, amount: absAmt, description: desc,
+      //       type: amountRaw < 0 ? 'expense' : 'income', suggestedCategory: 'Groceries', month: dateFormatted.slice(0, 7), isDuplicate: false, confirmed: true,
+      //     });
+      //   }
+      // }
+      // return res.json({ success: true, transactions: fallbackTransactions, method: 'local-csv-fallback', geminiAvailable, warning: fallbackTransactions.length===0 && !isCsv ? 'Only CSV is supported without Gemini. For PDF/images, set GEMINI_API_KEY.' : undefined });
+      // AI-ONLY: if we reach here, neither Gemini nor OpenRouter returned rows - return error so user knows AI failed
+      return res.status(502).json({ error: 'AI parsing failed — OpenRouter (and Gemini) did not return transactions. Check OPENROUTER_API_KEY, server logs, and try again. Local fallback is disabled (AI-only mode).', geminiAvailable, openrouter: !!getOpenRouterKey(), method: 'ai-only-no-fallback' });
     } catch (err: any) {
       console.error('Error parsing statement:', err);
       res.status(500).json({ error: err.message || 'Failed to parse statement' });
