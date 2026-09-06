@@ -33,7 +33,10 @@ let store: AppDataPayload = JSON.parse(JSON.stringify(initialDataPayload));
 // ── Gemini client ──
 let genAIClient: GoogleGenAI | null = null;
 function getGenAI(): GoogleGenAI | null {
-  if (!process.env.GEMINI_API_KEY) return null;
+  if (!process.env.GEMINI_API_KEY) {
+    console.warn('[gemini] GEMINI_API_KEY not set - AI parsing disabled, using CSV fallback only');
+    return null;
+  }
   if (!genAIClient) {
     genAIClient = new GoogleGenAI({
       apiKey: process.env.GEMINI_API_KEY,
@@ -523,9 +526,10 @@ export function createApp(): express.Express {
   app.post('/api/gemini/parse-statement', async (req, res) => {
     try {
       const { fileData, mimeType, fileName, existingTransactions } = req.body;
-      if (!fileData) return res.status(400).json({ error: 'fileData is required' });
+      if (!fileData) return res.status(400).json({ error: 'fileData is required', geminiAvailable: !!process.env.GEMINI_API_KEY });
       const ai = getGenAI();
       const isCsv = mimeType?.includes('csv') || fileName?.endsWith('.csv') || fileData.startsWith('data:text/csv');
+      const geminiAvailable = !!ai;
       if (ai) {
         try {
           let contentsPart: any;
@@ -580,8 +584,18 @@ Return ONLY a valid JSON array of these transaction objects.`;
             });
             return { id: `parsed-${Date.now()}-${idx}`, ...tx, amount: Math.abs(Number(tx.amount) || 0), isDuplicate: isDup, confirmed: !isDup };
           });
-          return res.json({ success: true, transactions: enriched, method: 'gemini-2.0-flash' });
-        } catch (geminiErr) { console.warn('Gemini API parse failed, checking fallback:', geminiErr); }
+          return res.json({ success: true, transactions: enriched, method: 'gemini-2.0-flash', geminiAvailable: true });
+        } catch (geminiErr: any) { 
+          console.warn('Gemini API parse failed, checking fallback:', geminiErr?.message || geminiErr);
+          // Return the actual gemini error to client so UI can show it
+          if (String(geminiErr?.message || '').includes('API_KEY') || String(geminiErr?.message || '').includes('not found')) {
+            return res.status(502).json({ error: 'Gemini AI error: ' + (geminiErr?.message || 'API key invalid'), geminiAvailable: false, method: 'gemini-error' });
+          }
+        }
+      }
+      // No Gemini or Gemini failed -> CSV fallback (only works for real CSV text)
+      if (!isCsv && !geminiAvailable) {
+        return res.json({ success: true, transactions: [], method: 'no-gemini-no-csv', geminiAvailable: false, warning: 'AI is not configured (GEMINI_API_KEY missing). PDF/Image parsing requires Gemini. Only CSV can be parsed without it. Add GEMINI_API_KEY in .env or Vercel env.' });
       }
       let textContent = fileData;
       if (fileData.startsWith('data:')) {
@@ -606,7 +620,7 @@ Return ONLY a valid JSON array of these transaction objects.`;
           });
         }
       }
-      return res.json({ success: true, transactions: fallbackTransactions, method: 'local-csv-fallback' });
+      return res.json({ success: true, transactions: fallbackTransactions, method: 'local-csv-fallback', geminiAvailable, warning: fallbackTransactions.length===0 && !isCsv ? 'Only CSV is supported without Gemini. For PDF/images, set GEMINI_API_KEY.' : undefined });
     } catch (err: any) {
       console.error('Error parsing statement:', err);
       res.status(500).json({ error: err.message || 'Failed to parse statement' });

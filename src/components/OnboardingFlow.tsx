@@ -113,9 +113,11 @@ export const OnboardingFlow: React.FC = () => {
   // Option B: Import Statement
   const [isParsingStatement, setIsParsingStatement] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
+  const [parseWarning, setParseWarning] = useState<string | null>(null);
   const [importedTransactions, setImportedTransactions] = useState<ParsedTransaction[]>([]);
   const [importedFileNames, setImportedFileNames] = useState<string[]>([]);
   const [aiEstimatedIncome, setAiEstimatedIncome] = useState<number | null>(null);
+  const [geminiAvailable, setGeminiAvailable] = useState<boolean | null>(null);
 
   // Estimate monthly income from parsed income transactions (avg per month)
   const computeAiEstimate = (txs: ParsedTransaction[]) => {
@@ -140,6 +142,17 @@ export const OnboardingFlow: React.FC = () => {
 
   // Submitting final onboarding
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Pre-check if Gemini is available so we can warn early
+  React.useEffect(() => {
+    fetch('/api/health').then(r=>r.json()).then(j=>{
+      if (j.gemini === false) {
+        setGeminiAvailable(false);
+      } else if (j.gemini === true) {
+        setGeminiAvailable(true);
+      }
+    }).catch(()=>{});
+  }, []);
 
   // Handlers
   const handleSignUpSubmit = (e: React.FormEvent) => {
@@ -179,6 +192,7 @@ export const OnboardingFlow: React.FC = () => {
 
     setIsParsingStatement(true);
     setParseError(null);
+    setParseWarning(null);
     setImportedFileNames(files.map(f => f.name));
 
     const readFileAsData = (file: File): Promise<string> => new Promise((resolve, reject) => {
@@ -203,8 +217,13 @@ export const OnboardingFlow: React.FC = () => {
             existingTransactions: allTxs,
           }),
         });
-        if (!res.ok) throw new Error(`Failed to parse ${file.name} with Gemini AI`);
         const data = await res.json();
+        if (data.geminiAvailable !== undefined) setGeminiAvailable(!!data.geminiAvailable);
+        if (data.warning) setParseWarning(data.warning);
+        if (!res.ok) {
+          const msg = data.error || `Failed to parse ${file.name}`;
+          throw new Error(msg + (data.warning ? ' — ' + data.warning : ''));
+        }
         if (data.transactions && Array.isArray(data.transactions)) {
           // Merge, de-dupe by date+amount+desc
           const newTxs: ParsedTransaction[] = data.transactions;
@@ -972,6 +991,16 @@ export const OnboardingFlow: React.FC = () => {
                     <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 font-medium flex items-center gap-2">
                       <AlertCircle className="w-4 h-4 shrink-0" />
                       <span>{parseError}</span>
+                    </div>
+                  )}
+                  {parseWarning && (
+                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 font-medium flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                      <div>
+                        <div className="font-bold">AI not configured</div>
+                        <div>{parseWarning}</div>
+                        {geminiAvailable===false && <div className="mt-1 text-[11px]">Fix: add <code className="bg-white px-1 rounded font-mono">GEMINI_API_KEY</code> to .env.local and Vercel env, then restart server. Without it, only CSV works — PDF/images will return 0. You can still type manually.</div>}
+                      </div>
                     </div>
                   )}
 
