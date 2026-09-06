@@ -67,9 +67,10 @@ Return ONLY a valid JSON array — one object per row, in order.`;
   const isDataUri = fileData.startsWith('data:');
   const isExcelFile = fileName?.toLowerCase().endsWith('.xls') || fileName?.toLowerCase().endsWith('.xlsx') || mimeType?.includes('spreadsheet') || mimeType?.includes('excel');
   let messages: any[];
-  // Choose free vision-capable model when file is image/pdf, else fast text model
+  // ONLY FREE MODELS (opencode free tier) — never paid gpt-4o. Tested working 2026-09:
+  // text (XLS/CSV): minimax/minimax-m3:free  | vision/PDF: nvidia/nemotron-3.5-lightning:free (falls back to text if vision fails)
   const isVision = isDataUri && (mimeType?.includes('pdf') || mimeType?.includes('image') || fileName?.match(/\.(pdf|jpg|jpeg|png|webp)$/i));
-  const model = isVision ? 'qwen/qwen-2.5-vl-32b-instruct:free' : 'mistralai/mistral-7b-instruct:free';
+  const model = isVision ? 'nvidia/nemotron-3.5-lightning:free' : 'minimax/minimax-m3:free';
 
   if (isVision) {
     messages = [{
