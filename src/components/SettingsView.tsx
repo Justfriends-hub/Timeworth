@@ -28,6 +28,29 @@ export const SettingsView: React.FC = () => {
   const [importedNames, setImportedNames] = useState<string[]>([]);
   const [ingestSuccess, setIngestSuccess] = useState<string | null>(null);
 
+
+  // Safe base64 decode that never throws "pattern" error - strips invalid chars, pads, and uses robust decoding
+  const safeAtob = (b64: string): string => {
+    try {
+      const clean = b64.replace(/\s/g,'').replace(/[^A-Za-z0-9+/=]/g,'');
+      // pad to multiple of 4
+      const pad = (4 - (clean.length % 4)) % 4;
+      const padded = clean + '='.repeat(pad);
+      return atob(padded);
+    } catch { return ''; }
+  };
+  const safeB64ToBytes = (b64: string): Uint8Array | null => {
+    try {
+      const clean = b64.replace(/\s/g,'').replace(/[^A-Za-z0-9+/=]/g,'');
+      const pad = (4 - (clean.length % 4)) % 4;
+      const padded = clean + '='.repeat(pad);
+      const bin = atob(padded);
+      const bytes = new Uint8Array(bin.length);
+      for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+      return bytes;
+    } catch { return null; }
+  };
+
   const localParseFallback = (file: File, fileData: string): any[] => {
     const name = file.name.toLowerCase();
     const isCsv = name.endsWith('.csv');
@@ -35,7 +58,7 @@ export const SettingsView: React.FC = () => {
     try {
       if (isCsv) {
         let text: string;
-        if (fileData.startsWith('data:')) { const c=fileData.indexOf(','); const b=fileData.slice(c+1).replace(/\s/g,''); try{ text=atob(b);}catch{ text=fileData; } } else text=fileData;
+        if (fileData.startsWith('data:')) { const c=fileData.indexOf(','); const b=fileData.slice(c+1).replace(/\s/g,''); try{ const d=safeAtob(b); text=d||fileData; }catch{ text=fileData; } } else text=fileData;
         const lines=text.split(/\r?\n/).filter((l:string)=>l.trim().length>0);
         const out:any[]=[];
         for(let i=1;i<lines.length;i++){ const cols=lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((c:string)=>c.replace(/^"|"$/g,'').trim()); if(cols.length<3) continue; const v=parseFloat(cols[2].replace(/[^0-9.-]/g,'')); if(isNaN(v)||v===0) continue; const abs=Math.abs(v); const d=new Date(cols[0]); const ds=!isNaN(d.getTime())?d.toISOString().split('T')[0]:new Date().toISOString().split('T')[0]; out.push({id:'set-csv-'+Date.now()+'-'+i,date:ds,amount:abs,description:(cols[1]||'Transaction').slice(0,60),type:v<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),confirmed:true}); }
@@ -43,7 +66,7 @@ export const SettingsView: React.FC = () => {
       }
       if (isExcel && fileData.startsWith('data:')) {
         const b64=fileData.slice(fileData.indexOf(',')+1).replace(/\s/g,'');
-        const buf=Uint8Array.from(atob(b64), c=>c.charCodeAt(0));
+        const _bytes=safeB64ToBytes(b64); if(!_bytes) return []; const buf=_bytes;
         const wb=XLSX.read(buf,{type:'array'});
         const sheet=wb.Sheets[wb.SheetNames[0]];
         const rows:any[][]=XLSX.utils.sheet_to_json(sheet,{header:1,defval:''});

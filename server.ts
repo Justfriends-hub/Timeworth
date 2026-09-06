@@ -128,7 +128,7 @@ Return ONLY a valid JSON array — one object per row, in order.`;
         messages,
         response_format: { type: 'json_object' },
         temperature: 0.1,
-        max_tokens: 4000,
+        max_tokens: 12000,
       }),
     });
     if (!resp.ok) {
@@ -663,28 +663,7 @@ export function createApp(): express.Express {
       const isPdf = mimeType?.includes('pdf') || fileName?.toLowerCase().endsWith('.pdf');
       const geminiAvailable = !!ai;
 
-      // XLS/XLSX is now handled by OpenRouter row-by-row AI above (see tryOpenRouterParse).
-      // If AI was not available or returned 0, fall back to local SheetJS (keeps all rows, categories default to Groceries)
-      if (isExcel && fileData.startsWith('data:')) {
-        try {
-          const commaIdxL = fileData.indexOf(',');
-          let b64L = commaIdxL !== -1 ? fileData.slice(commaIdxL+1).replace(/\s/g,'') : '';
-          if (b64L.length > 50) {
-            const bufferL = Buffer.from(b64L, 'base64');
-            const wbL = XLSX.read(bufferL, { type: 'buffer' });
-            const sheetL = wbL.Sheets[wbL.SheetNames[0]];
-            const rowsL:any[][] = XLSX.utils.sheet_to_json(sheetL, { header:1, defval:'' });
-            let headerIdxL=0;
-            for(let i=0;i<Math.min(5,rowsL.length);i++){const j=rowsL[i].join(' ').toLowerCase();if(j.includes('date')&&(j.includes('amount')||j.includes('debit')||j.includes('credit'))){headerIdxL=i;break;}}
-            const excelTxsL:any[]=[];
-            for(let i=headerIdxL+1;i<rowsL.length;i++){const r=rowsL[i];if(!r||r.length<2)continue;const dr=String(r[0]||'').trim();const desc=String(r[1]||r[2]||'Transaction').trim();let av:number|null=null;for(let c=2;c<Math.min(7,r.length);c++){const s=String(r[c]).replace(/[^0-9.-]/g,'');const n=parseFloat(s);if(!isNaN(n)&&n!==0&&Math.abs(n)>0.5){av=n;break;}}if(av===null||isNaN(av)||av===0)continue;const abs=Math.abs(av);let ds=new Date().toISOString().split('T')[0];if(typeof r[0]==='number'&&r[0]>30000){const d=new Date((r[0]-25569)*86400*1000);if(!isNaN(d.getTime()))ds=d.toISOString().split('T')[0];}else{const d=new Date(dr);if(!isNaN(d.getTime())&&dr.length>=6)ds=d.toISOString().split('T')[0];}excelTxsL.push({id:`parsed-xls-${Date.now()}-${i}`,date:ds,amount:abs,description:desc.slice(0,60),type:av<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),isDuplicate:false,confirmed:true});}
-            if(excelTxsL.length>0){
-              return res.json({ success:true, transactions:excelTxsL, method:'local-xlsx-fallback', geminiAvailable, warning: geminiAvailable?undefined:'Parsed locally from Excel without AI. Add GEMINI_API_KEY or OPENROUTER_API_KEY for AI row-by-row categorization.' });
-            }
-          }
-        } catch(e:any){ console.warn('[xlsx local fallback after AI] failed',e?.message); }
-      }
-
+      // XLS row-by-row: ALWAYS try OpenRouter AI first (user wants AI accuracy, not fast local). Local is last resort only after AI fails.
       if (ai) {
         try {
           let contentsPart: any;
@@ -767,7 +746,26 @@ Return ONLY a valid JSON array — one object per row, in original order.`;
           return res.json({ success: true, transactions: enriched, method: 'openrouter-free', geminiAvailable, openrouter: true });
         }
       }
-      // XLS already tried at top fast-path; if we reach here, XLS parse returned 0 rows - continue to generic CSV/text fallback
+      // If OpenRouter row-by-row AI failed for XLS, fall back to local XLS parse as LAST resort (keeps all rows, generic category)
+      if (isExcel && fileData.startsWith('data:')) {
+        try {
+          const commaIdxL2 = fileData.indexOf(',');
+          let b64L2 = commaIdxL2 !== -1 ? fileData.slice(commaIdxL2+1).replace(/\s/g,'') : '';
+          if (b64L2.length > 50) {
+            const bufferL2 = Buffer.from(b64L2, 'base64');
+            const wbL2 = XLSX.read(bufferL2, { type: 'buffer' });
+            const sheetL2 = wbL2.Sheets[wbL2.SheetNames[0]];
+            const rowsL2:any[][] = XLSX.utils.sheet_to_json(sheetL2, { header:1, defval:'' });
+            let headerIdxL2=0;
+            for(let i=0;i<Math.min(5,rowsL2.length);i++){const j=rowsL2[i].join(' ').toLowerCase();if(j.includes('date')&&(j.includes('amount')||j.includes('debit')||j.includes('credit'))){headerIdxL2=i;break;}}
+            const excelTxsL2:any[]=[];
+            for(let i=headerIdxL2+1;i<rowsL2.length;i++){const r=rowsL2[i];if(!r||r.length<2)continue;const dr=String(r[0]||'').trim();const desc=String(r[1]||r[2]||'Transaction').trim();let av:number|null=null;for(let c=2;c<Math.min(7,r.length);c++){const s=String(r[c]).replace(/[^0-9.-]/g,'');const n=parseFloat(s);if(!isNaN(n)&&n!==0&&Math.abs(n)>0.5){av=n;break;}}if(av===null||isNaN(av)||av===0)continue;const abs=Math.abs(av);let ds=new Date().toISOString().split('T')[0];if(typeof r[0]==='number'&&r[0]>30000){const d=new Date((r[0]-25569)*86400*1000);if(!isNaN(d.getTime()))ds=d.toISOString().split('T')[0];}else{const d=new Date(dr);if(!isNaN(d.getTime())&&dr.length>=6)ds=d.toISOString().split('T')[0];}excelTxsL2.push({id:`parsed-xls-fallback-${Date.now()}-${i}`,date:ds,amount:abs,description:desc.slice(0,60),type:av<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),isDuplicate:false,confirmed:true});}
+            if(excelTxsL2.length>0){
+              return res.json({ success:true, transactions:excelTxsL2, method:'local-xlsx-after-ai-failed', geminiAvailable, openrouter: !!getOpenRouterKey(), warning: 'AI row-by-row failed ('+ (getOpenRouterKey()?'OpenRouter did not return rows':'no OPENROUTER_API_KEY') +') — parsed locally after AI, categories are generic. Check server logs.' });
+            }
+          }
+        } catch(e:any){ console.warn('[xlsx fallback after AI failed]',e?.message); }
+      }
       if (!isCsv && !isExcel && !geminiAvailable) {
         return res.json({ success: true, transactions: [], method: 'no-gemini-no-csv', geminiAvailable: false, warning: 'AI is not configured (GEMINI_API_KEY missing). PDF/Image/XLS parsing needs Gemini for best results, but CSV and XLS are parsed locally. Add GEMINI_API_KEY in .env or Vercel env for better AI categorization.' });
       }
