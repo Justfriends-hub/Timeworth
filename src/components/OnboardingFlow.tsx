@@ -197,11 +197,24 @@ export const OnboardingFlow: React.FC = () => {
 
     const readFileAsData = (file: File): Promise<string> => new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
+      reader.onload = () => {
+        try {
+          const result = reader.result as string;
+          // FileReader for dataURL can sometimes return ArrayBuffer-like object on some browsers - guard
+          if (typeof result !== 'string') {
+            reject(new Error('Unexpected file read result for ' + file.name));
+            return;
+          }
+          resolve(result);
+        } catch (e:any) {
+          reject(new Error('Failed to process ' + file.name + ': ' + (e?.message || e)));
+        }
+      };
       reader.onerror = () => reject(new Error('Failed to read ' + file.name));
       const name = file.name.toLowerCase();
+      // XLS/XLSX/PDF/images -> base64; CSV -> text (utf-8)
       if (name.endsWith('.csv') || file.type.includes('csv')) reader.readAsText(file);
-      else reader.readAsDataURL(file); // PDF, XLS/XLSX, images -> base64 for Gemini
+      else reader.readAsDataURL(file);
     });
 
     try {
@@ -218,12 +231,20 @@ export const OnboardingFlow: React.FC = () => {
             existingTransactions: allTxs,
           }),
         });
-        const data = await res.json();
+        let data: any;
+        try {
+          const text = await res.text();
+          data = text ? JSON.parse(text) : {};
+        } catch (e:any) {
+          throw new Error('Server returned invalid response for ' + file.name + ' (' + res.status + '). Try a smaller file or CSV export.');
+        }
         if (data.geminiAvailable !== undefined) setGeminiAvailable(!!data.geminiAvailable);
         if (data.warning) setParseWarning(data.warning);
         if (!res.ok) {
-          const msg = data.error || `Failed to parse ${file.name}`;
-          throw new Error(msg + (data.warning ? ' — ' + data.warning : ''));
+          const msg = data.error || `Failed to parse ${file.name} (${res.status})`;
+          // map common pattern error to helpful hint
+          const hint = String(msg).includes('pattern') ? ' — File read failed. Re-export as CSV or XLSX and try again.' : '';
+          throw new Error(msg + (data.warning ? ' — ' + data.warning : '') + hint);
         }
         if (data.transactions && Array.isArray(data.transactions)) {
           // Merge, de-dupe by date+amount+desc
@@ -244,7 +265,9 @@ export const OnboardingFlow: React.FC = () => {
       if (allTxs.length === 0) setParseError('No transactions could be parsed from the selected files.');
     } catch (err: any) {
       console.error(err);
-      setParseError(err.message || 'Error parsing statements');
+      const msg = err?.message || 'Error parsing statements';
+      const friendly = String(msg).includes('pattern') ? msg + ' — This usually means the file was corrupted or too large. Try exporting as CSV or a smaller XLSX.' : msg;
+      setParseError(friendly);
     } finally {
       setIsParsingStatement(false);
       // reset input so same files can be re-selected + allow adding more

@@ -34,12 +34,13 @@ let store: AppDataPayload = JSON.parse(JSON.stringify(initialDataPayload));
 // ── Gemini client ──
 let genAIClient: GoogleGenAI | null = null;
 function getGenAI(): GoogleGenAI | null {
-  if (!process.env.GEMINI_API_KEY) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
     return null;
   }
   if (!genAIClient) {
     genAIClient = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
+      apiKey,
       httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
     });
   }
@@ -619,21 +620,83 @@ export function createApp(): express.Express {
     res.json({ success: true, store });
   });
 
-  // 14. Gemini Statement Parser
+  // 14. Statement Parser (Gemini -> OpenRouter free -> local XLS/CSV)
   app.post('/api/gemini/parse-statement', async (req, res) => {
     try {
       const { fileData, mimeType, fileName, existingTransactions } = req.body;
       if (!fileData) return res.status(400).json({ error: 'fileData is required', geminiAvailable: !!process.env.GEMINI_API_KEY });
       const ai = getGenAI();
-      const isCsv = mimeType?.includes('csv') || fileName?.endsWith('.csv') || fileData.startsWith('data:text/csv');
+      const isCsv = mimeType?.includes('csv') || fileName?.toLowerCase().endsWith('.csv') || fileData.startsWith('data:text/csv');
+      const isExcel = fileName?.toLowerCase().endsWith('.xls') || fileName?.toLowerCase().endsWith('.xlsx') || mimeType?.includes('spreadsheet') || mimeType?.includes('excel');
+      const isPdf = mimeType?.includes('pdf') || fileName?.toLowerCase().endsWith('.pdf');
       const geminiAvailable = !!ai;
+
+      // --- FAST LOCAL XLS/XLSX path (no AI needed) - avoids pattern errors for Excel ---
+      if (isExcel) {
+        try {
+          const commaIdx = fileData.indexOf(',');
+          let base64 = commaIdx !== -1 ? fileData.slice(commaIdx + 1) : fileData;
+          base64 = base64.replace(/\s/g, '');
+          // if fileData was read as text (rare), base64 will be the text itself - detect and skip
+          if (fileData.startsWith('data:') && base64.length > 100) {
+            const buffer = Buffer.from(base64, 'base64');
+            const wb = XLSX.read(buffer, { type: 'buffer' });
+            const sheetName = wb.SheetNames[0];
+            const sheet = wb.Sheets[sheetName];
+            const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+            let headerIdx = 0;
+            for (let i=0;i<Math.min(5, rows.length);i++) {
+              const joined = rows[i].join(' ').toLowerCase();
+              if (joined.includes('date') && (joined.includes('amount') || joined.includes('debit') || joined.includes('credit'))) { headerIdx = i; break; }
+            }
+            const excelTxs: any[] = [];
+            for (let i=headerIdx+1; i<rows.length; i++) {
+              const r = rows[i];
+              if (!r || r.length < 2) continue;
+              const dateRaw = String(r[0]||'').trim();
+              const desc = String(r[1]|| r[2] || 'Transaction').trim();
+              let amountRaw: number | null = null;
+              for (let c=2;c<Math.min(7, r.length);c++) {
+                const v = String(r[c]).replace(/[^0-9.\-]/g,'');
+                const n = parseFloat(v);
+                if (!isNaN(n) && n!==0 && Math.abs(n) > 0.5) { amountRaw = n; break; }
+              }
+              if (amountRaw===null || isNaN(amountRaw) || amountRaw===0) continue;
+              const absAmt = Math.abs(amountRaw);
+              let dateFormatted = new Date().toISOString().split('T')[0];
+              if (typeof r[0] === 'number' && r[0] > 30000) {
+                const excelDate = new Date((r[0] - 25569) * 86400 * 1000);
+                if (!isNaN(excelDate.getTime())) dateFormatted = excelDate.toISOString().split('T')[0];
+              } else {
+                const parsed = new Date(dateRaw);
+                if (!isNaN(parsed.getTime()) && dateRaw.length >= 6) dateFormatted = parsed.toISOString().split('T')[0];
+              }
+              excelTxs.push({
+                id: `parsed-xls-${Date.now()}-${i}`, date: dateFormatted, amount: absAmt, description: desc.slice(0,60),
+                type: amountRaw < 0 ? 'expense' : (String(r[3]||'').toLowerCase().includes('debit') ? 'expense' : 'income'), suggestedCategory: 'Groceries', month: dateFormatted.slice(0,7), isDuplicate: false, confirmed: true,
+              });
+            }
+            if (excelTxs.length > 0) {
+              return res.json({ success: true, transactions: excelTxs, method: 'local-xlsx-fallback', geminiAvailable, warning: geminiAvailable ? undefined : 'Parsed locally from Excel without AI (no GEMINI_API_KEY). For better categorization, add GEMINI_API_KEY.' });
+            }
+          }
+        } catch (xlsErr: any) {
+          console.warn('[xlsx local] failed, will try AI:', xlsErr?.message);
+        }
+      }
+
       if (ai) {
         try {
           let contentsPart: any;
           if (fileData.startsWith('data:')) {
-            const match = fileData.match(/^data:([^;]+);base64,(.+)$/);
-            if (match) {
-              contentsPart = { inlineData: { mimeType: match[1] || 'application/pdf', data: match[2] } };
+            const commaIdx2 = fileData.indexOf(',');
+            const meta = fileData.slice(0, commaIdx2);
+            let b64 = fileData.slice(commaIdx2 + 1).replace(/\s/g,'');
+            const mimeMatch = meta.match(/data:([^;]+)/);
+            const detectedMime = mimeMatch ? mimeMatch[1] : (isPdf ? 'application/pdf' : 'image/png');
+            // robust: only use inlineData if b64 looks like base64 (length > 100 and valid chars)
+            if (b64.length > 100 && /^[A-Za-z0-9+/=\s]+$/.test(b64.slice(0,500))) {
+              contentsPart = { inlineData: { mimeType: detectedMime || 'application/pdf', data: b64 } };
             } else { contentsPart = { text: fileData }; }
           } else { contentsPart = { text: fileData }; }
           const promptText = `You are a financial parsing expert. Analyze this bank statement document, CSV, or statement image.
@@ -703,67 +766,19 @@ Return ONLY a valid JSON array of these transaction objects.`;
           return res.json({ success: true, transactions: enriched, method: 'openrouter-free', geminiAvailable, openrouter: true });
         }
       }
-      // No Gemini or Gemini+OpenRouter failed -> try local fallbacks (CSV + XLS/XLSX without AI)
-      const isExcel = fileName?.toLowerCase().endsWith('.xls') || fileName?.toLowerCase().endsWith('.xlsx') || mimeType?.includes('spreadsheet') || mimeType?.includes('excel');
-      if (isExcel && fileData.startsWith('data:')) {
-        try {
-          const base64 = fileData.split(',')[1];
-          const buffer = Buffer.from(base64, 'base64');
-          const wb = XLSX.read(buffer, { type: 'buffer' });
-          const sheetName = wb.SheetNames[0];
-          const sheet = wb.Sheets[sheetName];
-          const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
-          // Heuristic: find header row with date/description/amount
-          let headerIdx = 0;
-          for (let i=0;i<Math.min(5, rows.length);i++) {
-            const joined = rows[i].join(' ').toLowerCase();
-            if (joined.includes('date') && (joined.includes('amount') || joined.includes('debit') || joined.includes('credit'))) { headerIdx = i; break; }
-          }
-          const excelTxs: any[] = [];
-          for (let i=headerIdx+1; i<rows.length; i++) {
-            const r = rows[i];
-            if (!r || r.length < 2) continue;
-            // Try to find date in col 0, desc in col 1, amount in col 2 or 3/4
-            const dateRaw = String(r[0]||'').trim();
-            const desc = String(r[1]|| r[2] || 'Transaction').trim();
-            // search amount: first numeric with maybe comma in col 2..5
-            let amountRaw: number | null = null;
-            for (let c=2;c<Math.min(7, r.length);c++) {
-              const v = String(r[c]).replace(/[^0-9.\-]/g,'');
-              const n = parseFloat(v);
-              if (!isNaN(n) && n!==0 && Math.abs(n) > 0.5) { amountRaw = n; break; }
-            }
-            if (amountRaw===null || isNaN(amountRaw) || amountRaw===0) continue;
-            const absAmt = Math.abs(amountRaw);
-            let dateFormatted = new Date().toISOString().split('T')[0];
-            // Excel date may be a number (serial) or string
-            if (typeof r[0] === 'number' && r[0] > 30000) {
-              // Excel serial date
-              const excelDate = new Date((r[0] - 25569) * 86400 * 1000);
-              if (!isNaN(excelDate.getTime())) dateFormatted = excelDate.toISOString().split('T')[0];
-            } else {
-              const parsed = new Date(dateRaw);
-              if (!isNaN(parsed.getTime()) && dateRaw.length >= 6) dateFormatted = parsed.toISOString().split('T')[0];
-            }
-            excelTxs.push({
-              id: `parsed-xls-${Date.now()}-${i}`, date: dateFormatted, amount: absAmt, description: desc.slice(0,60),
-              type: amountRaw < 0 ? 'expense' : (String(r[3]||'').toLowerCase().includes('debit') ? 'expense' : 'income'), suggestedCategory: 'Groceries', month: dateFormatted.slice(0,7), isDuplicate: false, confirmed: true,
-            });
-          }
-          if (excelTxs.length > 0) {
-            return res.json({ success: true, transactions: excelTxs, method: 'local-xlsx-fallback', geminiAvailable, warning: geminiAvailable ? undefined : 'Parsed locally from Excel without AI (no GEMINI_API_KEY). For better categorization, add GEMINI_API_KEY.' });
-          }
-        } catch (xlsErr: any) {
-          console.warn('[xlsx fallback] failed:', xlsErr?.message);
-        }
-      }
+      // XLS already tried at top fast-path; if we reach here, XLS parse returned 0 rows - continue to generic CSV/text fallback
       if (!isCsv && !isExcel && !geminiAvailable) {
         return res.json({ success: true, transactions: [], method: 'no-gemini-no-csv', geminiAvailable: false, warning: 'AI is not configured (GEMINI_API_KEY missing). PDF/Image/XLS parsing needs Gemini for best results, but CSV and XLS are parsed locally. Add GEMINI_API_KEY in .env or Vercel env for better AI categorization.' });
       }
       let textContent = fileData;
       if (fileData.startsWith('data:')) {
-        const base64 = fileData.split(',')[1];
-        if (base64) textContent = Buffer.from(base64, 'base64').toString('utf-8');
+        const commaIdx3 = fileData.indexOf(',');
+        if (commaIdx3 !== -1) {
+          const b64raw = fileData.slice(commaIdx3 + 1).replace(/\s/g,'');
+          if (b64raw) {
+            try { textContent = Buffer.from(b64raw, 'base64').toString('utf-8'); } catch { textContent = fileData; }
+          }
+        }
       }
       const lines = textContent.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
       const fallbackTransactions: any[] = [];
