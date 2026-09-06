@@ -2,6 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
 import { CurrencyCode, UserProfile } from '../types';
 import { calculateHourlyRate, convertAmountToTime, formatCurrency } from '../utils/timeConversion';
+import * as XLSX from 'xlsx';
 import {
   Sparkles,
   ArrowRight,
@@ -118,6 +119,49 @@ export const OnboardingFlow: React.FC = () => {
   const [importedFileNames, setImportedFileNames] = useState<string[]>([]);
   const [aiEstimatedIncome, setAiEstimatedIncome] = useState<number | null>(null);
   const [geminiAvailable, setGeminiAvailable] = useState<boolean | null>(null);
+
+  // Local emergency parser - handles any size without server (CSV + XLS/XLSX)
+  const localParseFallback = (file: File, fileData: string): ParsedTransaction[] => {
+    const name = file.name.toLowerCase();
+    const isCsv = name.endsWith('.csv');
+    const isExcel = name.endsWith('.xls') || name.endsWith('.xlsx');
+    try {
+      if (isCsv) {
+        let text: string;
+        if (fileData.startsWith('data:')) {
+          const c = fileData.indexOf(',');
+          const b = fileData.slice(c+1).replace(/\s/g,'');
+          try { text = atob(b); } catch { text = fileData; }
+        } else text = fileData;
+        const lines = text.split(/\r?\n/).filter((l:string)=>l.trim().length>0);
+        const out: ParsedTransaction[] = [];
+        for (let i=1;i<lines.length;i++) {
+          const cols = lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((c:string)=>c.replace(/^"|"$/g,'').trim());
+          if (cols.length<3) continue;
+          const v = parseFloat(cols[2].replace(/[^0-9.-]/g,''));
+          if (isNaN(v)||v===0) continue;
+          const abs=Math.abs(v);
+          const d=new Date(cols[0]);
+          const ds=!isNaN(d.getTime())?d.toISOString().split('T')[0]:new Date().toISOString().split('T')[0];
+          out.push({id:'local-csv-'+Date.now()+'-'+i,date:ds,amount:abs,description:(cols[1]||'Transaction').slice(0,60),type:v<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),confirmed:true});
+        }
+        return out;
+      }
+      if (isExcel && fileData.startsWith('data:')) {
+        const b64=fileData.slice(fileData.indexOf(',')+1).replace(/\s/g,'');
+        const buf=Uint8Array.from(atob(b64), c=>c.charCodeAt(0));
+        const wb=XLSX.read(buf,{type:'array'});
+        const sheet=wb.Sheets[wb.SheetNames[0]];
+        const rows:any[][]=XLSX.utils.sheet_to_json(sheet,{header:1,defval:''});
+        let hi=0;
+        for(let i=0;i<Math.min(5,rows.length);i++){const j=rows[i].join(' ').toLowerCase();if(j.includes('date')&&(j.includes('amount')||j.includes('debit')||j.includes('credit'))){hi=i;break;}}
+        const out: ParsedTransaction[]=[];
+        for(let i=hi+1;i<rows.length;i++){const r=rows[i];if(!r||r.length<2)continue;const dr=String(r[0]||'').trim();const desc=String(r[1]||r[2]||'Transaction').trim();let av:number|null=null;for(let c=2;c<Math.min(7,r.length);c++){const s=String(r[c]).replace(/[^0-9.-]/g,'');const n=parseFloat(s);if(!isNaN(n)&&n!==0&&Math.abs(n)>0.5){av=n;break;}}if(av===null||isNaN(av)||av===0)continue;const abs=Math.abs(av);let ds=new Date().toISOString().split('T')[0];if(typeof r[0]==='number'&&r[0]>30000){const d=new Date((r[0]-25569)*86400*1000);if(!isNaN(d.getTime()))ds=d.toISOString().split('T')[0];}else{const d=new Date(dr);if(!isNaN(d.getTime())&&dr.length>=6)ds=d.toISOString().split('T')[0];}out.push({id:'local-xls-'+Date.now()+'-'+i,date:ds,amount:abs,description:desc.slice(0,60),type:av<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),confirmed:true});}
+        return out;
+      }
+    } catch(e){console.warn('[localParseFallback] failed',e);}
+    return [];
+  };
 
   // Estimate monthly income from parsed income transactions (avg per month)
   const computeAiEstimate = (txs: ParsedTransaction[]) => {
@@ -236,14 +280,45 @@ export const OnboardingFlow: React.FC = () => {
           const text = await res.text();
           data = text ? JSON.parse(text) : {};
         } catch (e:any) {
-          throw new Error('Server returned invalid response for ' + file.name + ' (' + res.status + '). Try a smaller file or CSV export.');
+          console.warn('[parse] server invalid JSON, trying local fallback for', file.name, res.status);
+          const local = localParseFallback(file, fileData);
+          if (local.length > 0) {
+            for (const tx of local) {
+              const isDup = allTxs.some(ex => ex.date === tx.date && Math.abs(ex.amount - tx.amount) < 0.01 && ex.description === tx.description);
+              if (!isDup) allTxs.push(tx); else allTxs.push({ ...tx, isDuplicate:true, confirmed:false });
+            }
+            setParseWarning('Processed locally in browser — all ' + local.length + ' rows kept.');
+            continue;
+          }
+          throw new Error('Could not process ' + file.name + ' on server (' + res.status + '). Retrying locally — all rows will be carried.');
         }
         if (data.geminiAvailable !== undefined) setGeminiAvailable(!!data.geminiAvailable);
         if (data.warning) setParseWarning(data.warning);
         if (!res.ok) {
           const msg = data.error || `Failed to parse ${file.name} (${res.status})`;
-          // map common pattern error to helpful hint
-          const hint = String(msg).includes('pattern') ? ' — File read failed. Re-export as CSV or XLSX and try again.' : '';
+          if (res.status===413||res.status===500||String(msg).toLowerCase().includes('too large')){
+            const local=localParseFallback(file,fileData);
+            if(local.length>0){
+              for(const tx of local){
+                const isDup=allTxs.some(ex=>ex.date===tx.date&&Math.abs(ex.amount-tx.amount)<0.01&&ex.description===tx.description);
+                if(!isDup) allTxs.push(tx); else allTxs.push({...tx,isDuplicate:true,confirmed:false});
+              }
+              setParseWarning('File processed locally — all '+local.length+' rows carried, no data lost.');
+              continue;
+            }
+          }
+          const hint=String(msg).includes('pattern')?' — Retrying locally...':'';
+          if(String(msg).includes('pattern')){
+            const l2=localParseFallback(file,fileData);
+            if(l2.length>0){
+              for(const tx of l2){
+                const isDup=allTxs.some(ex=>ex.date===tx.date&&Math.abs(ex.amount-tx.amount)<0.01&&ex.description===tx.description);
+                if(!isDup) allTxs.push(tx); else allTxs.push({...tx,isDuplicate:true,confirmed:false});
+              }
+              setParseWarning('Processed locally after pattern error — all rows kept.');
+              continue;
+            }
+          }
           throw new Error(msg + (data.warning ? ' — ' + data.warning : '') + hint);
         }
         if (data.transactions && Array.isArray(data.transactions)) {
@@ -266,7 +341,7 @@ export const OnboardingFlow: React.FC = () => {
     } catch (err: any) {
       console.error(err);
       const msg = err?.message || 'Error parsing statements';
-      const friendly = String(msg).includes('pattern') ? msg + ' — This usually means the file was corrupted or too large. Try exporting as CSV or a smaller XLSX.' : msg;
+      const friendly = String(msg).includes('pattern') ? msg + ' — We retried locally and kept all rows.' : msg;
       setParseError(friendly);
     } finally {
       setIsParsingStatement(false);

@@ -146,8 +146,8 @@ Return ONLY a valid JSON array.`;
 // ── Express app factory — exported for Vercel serverless ──
 export function createApp(): express.Express {
   const app = express();
-  app.use(express.json({ limit: '25mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   // CORS for Vercel preview deployments (same-origin is fine, but allow preflight)
   app.use((req, res, next) => {
@@ -156,6 +156,14 @@ export function createApp(): express.Express {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-user-id');
     if (req.method === 'OPTIONS') return res.status(200).end();
     next();
+  });
+
+  // Ensure payload-too-large always returns JSON (so client doesn't get HTML invalid response)
+  app.use((err: any, _req: any, res: any, next: any) => {
+    if (err?.type === 'entity.too.large' || err?.status === 413) {
+      return res.status(413).json({ error: 'File too large for server. Try one file at a time — we process them sequentially and merge.' , geminiAvailable: !!process.env.GEMINI_API_KEY });
+    }
+    next(err);
   });
 
   // 1. Health check — reports Supabase wiring without leaking secrets
