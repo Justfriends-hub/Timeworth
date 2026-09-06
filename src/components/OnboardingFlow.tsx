@@ -114,7 +114,21 @@ export const OnboardingFlow: React.FC = () => {
   const [isParsingStatement, setIsParsingStatement] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
   const [importedTransactions, setImportedTransactions] = useState<ParsedTransaction[]>([]);
-  const [importedFileName, setImportedFileName] = useState<string | null>(null);
+  const [importedFileNames, setImportedFileNames] = useState<string[]>([]);
+  const [aiEstimatedIncome, setAiEstimatedIncome] = useState<number | null>(null);
+
+  // Estimate monthly income from parsed income transactions (avg per month)
+  const computeAiEstimate = (txs: ParsedTransaction[]) => {
+    const incomeByMonth: Record<string, number> = {};
+    txs.filter(t => t.type === 'income').forEach(t => {
+      const m = t.month || t.date.slice(0,7);
+      incomeByMonth[m] = (incomeByMonth[m] || 0) + t.amount;
+    });
+    const months = Object.keys(incomeByMonth);
+    if (months.length === 0) return null;
+    const total = Object.values(incomeByMonth).reduce((a,b)=>a+b,0);
+    return Math.round(total / months.length);
+  };
 
   // Step 4: Bank Accounts
   const [bankRows, setBankRows] = useState<Array<{ id: string; bankName: string; label: string; balance: string }>>([
@@ -158,57 +172,63 @@ export const OnboardingFlow: React.FC = () => {
     setItemizedList(prev => prev.filter(item => item.id !== id));
   };
 
-  // Step 3: Handle Statement File Upload
+  // Step 3: Handle Statement File Upload (supports MULTIPLE files)
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = e.target.files ? Array.from(e.target.files) : [];
+    if (files.length === 0) return;
 
     setIsParsingStatement(true);
     setParseError(null);
-    setImportedFileName(file.name);
+    setImportedFileNames(files.map(f => f.name));
+
+    const readFileAsData = (file: File): Promise<string> => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(new Error('Failed to read ' + file.name));
+      if (file.name.endsWith('.csv') || file.type.includes('csv')) reader.readAsText(file);
+      else reader.readAsDataURL(file);
+    });
 
     try {
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const fileData = reader.result as string;
-        try {
-          const res = await fetch('/api/gemini/parse-statement', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              fileData,
-              mimeType: file.type || 'text/plain',
-              fileName: file.name,
-              existingTransactions: [],
-            }),
-          });
-
-          if (!res.ok) {
-            throw new Error('Failed to analyze statement with Gemini AI');
+      let allTxs: ParsedTransaction[] = [...importedTransactions];
+      for (const file of files) {
+        const fileData = await readFileAsData(file);
+        const res = await fetch('/api/gemini/parse-statement', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fileData,
+            mimeType: file.type || 'text/plain',
+            fileName: file.name,
+            existingTransactions: allTxs,
+          }),
+        });
+        if (!res.ok) throw new Error(`Failed to parse ${file.name} with Gemini AI`);
+        const data = await res.json();
+        if (data.transactions && Array.isArray(data.transactions)) {
+          // Merge, de-dupe by date+amount+desc
+          const newTxs: ParsedTransaction[] = data.transactions;
+          for (const tx of newTxs) {
+            const isDup = allTxs.some(ex => ex.date === tx.date && Math.abs(ex.amount - tx.amount) < 0.01 && ex.description === tx.description);
+            if (!isDup) allTxs.push(tx);
+            else {
+              // mark duplicate but still keep one
+              allTxs.push({ ...tx, isDuplicate: true, confirmed: false });
+            }
           }
-
-          const data = await res.json();
-          if (data.transactions && Array.isArray(data.transactions)) {
-            setImportedTransactions(data.transactions);
-          } else {
-            setParseError('No transactions could be parsed from this file.');
-          }
-        } catch (err: any) {
-          console.error(err);
-          setParseError(err.message || 'Error parsing statement');
-        } finally {
-          setIsParsingStatement(false);
         }
-      };
-
-      if (file.name.endsWith('.csv') || file.type.includes('csv')) {
-        reader.readAsText(file);
-      } else {
-        reader.readAsDataURL(file);
       }
+      setImportedTransactions(allTxs);
+      const est = computeAiEstimate(allTxs);
+      if (est) setAiEstimatedIncome(est);
+      if (allTxs.length === 0) setParseError('No transactions could be parsed from the selected files.');
     } catch (err: any) {
+      console.error(err);
+      setParseError(err.message || 'Error parsing statements');
+    } finally {
       setIsParsingStatement(false);
-      setParseError(err.message || 'Failed to read file');
+      // reset input so same files can be re-selected + allow adding more
+      e.target.value = '';
     }
   };
 
@@ -314,7 +334,7 @@ export const OnboardingFlow: React.FC = () => {
           name: name.trim() || 'User',
           currency,
           currencySymbol,
-          monthlyIncome,
+          monthlyIncome: monthlyIncome > 0 ? monthlyIncome : (aiEstimatedIncome || monthlyIncome),
           workDaysPerWeek,
           workHoursPerDay,
         },
@@ -641,8 +661,17 @@ export const OnboardingFlow: React.FC = () => {
                     className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-base font-extrabold text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 font-mono"
                   />
                   <span className="text-[11px] text-slate-400 mt-1 block">
-                    Average take-home salary or total monthly earnings.
+                    Average take-home salary or total monthly earnings. <span className="text-emerald-700 font-bold">No fixed salary?</span> Leave it — upload {importedFileNames.length>0 ? 'your' : ''} statement(s) next and AI will estimate it for you.
                   </span>
+                  {aiEstimatedIncome && (
+                    <div className="mt-2 p-2.5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between">
+                      <div className="text-xs">
+                        <div className="font-bold text-emerald-900">AI estimate from {importedFileNames.length} statement(s): {formatCurrency(aiEstimatedIncome, currencySymbol)}/mo</div>
+                        <div className="text-[11px] text-emerald-700">Avg of your credits across {new Set(importedTransactions.filter(t=>t.type==='income').map(t=>t.month || t.date.slice(0,7))).size || 1} month(s)</div>
+                      </div>
+                      <button type="button" onClick={()=>setMonthlyIncomeStr(String(aiEstimatedIncome))} className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-xs font-bold hover:bg-emerald-700">Apply</button>
+                    </div>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -710,11 +739,14 @@ export const OnboardingFlow: React.FC = () => {
                   Back
                 </button>
                 <button
-                  disabled={monthlyIncome <= 0}
-                  onClick={() => setCurrentStep(3)}
+                  disabled={monthlyIncome <= 0 && !aiEstimatedIncome}
+                  onClick={() => {
+                    if (monthlyIncome <= 0 && aiEstimatedIncome) setMonthlyIncomeStr(String(aiEstimatedIncome));
+                    setCurrentStep(3);
+                  }}
                   className="px-6 py-2.5 bg-emerald-600 disabled:opacity-50 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs"
                 >
-                  <span>Continue to Catch-up</span>
+                  <span>Continue to Catch-up {monthlyIncome<=0 && aiEstimatedIncome ? `(AI: ${formatCurrency(aiEstimatedIncome,currencySymbol)})` : ''}</span>
                   <ArrowRight className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -884,28 +916,44 @@ export const OnboardingFlow: React.FC = () => {
                           Option B: Import Bank Statement (AI Parser)
                         </h3>
                         <span className="text-[11px] text-emerald-800 font-medium">
-                          Supports PDF, CSV, or screenshots. Spans single or multiple months.
+                          Supports PDF, CSV, or screenshots. Upload MULTIPLE files at once — spans single or multiple months. No manual typing needed.
                         </span>
                       </div>
                     </div>
                   </div>
 
-                  {/* File Upload Zone */}
+                  {/* File Upload Zone - MULTIPLE */}
                   <label className="border-2 border-dashed border-emerald-300 hover:border-emerald-500 rounded-2xl p-4 flex flex-col items-center justify-center cursor-pointer bg-white transition-all">
                     <UploadCloud className="w-8 h-8 text-emerald-600 mb-1" />
-                    <span className="text-xs font-bold text-slate-800">
-                      {importedFileName ? `Selected: ${importedFileName}` : 'Click to select or drop statement file'}
+                    <span className="text-xs font-bold text-slate-800 text-center">
+                      {importedFileNames.length > 0 ? `${importedFileNames.length} file(s): ${importedFileNames.join(', ').slice(0,80)}${importedFileNames.join(', ').length>80?'...':''}` : 'Click to select or drop MULTIPLE statement files'}
                     </span>
-                    <span className="text-[11px] text-slate-400 mt-0.5">
-                      PDF, CSV, JPG, PNG (Gemini AI extracts multi-month line items)
+                    <span className="text-[11px] text-slate-400 mt-0.5 text-center">
+                      PDF, CSV, JPG, PNG — select many at once. AI extracts & merges all, auto-estimates salary.
                     </span>
                     <input
                       type="file"
                       accept=".pdf,.csv,image/*"
+                      multiple
                       onChange={handleFileUpload}
                       className="hidden"
                     />
                   </label>
+                  {importedFileNames.length > 0 && (
+                    <div className="flex items-center gap-2">
+                      <button type="button" onClick={()=>{setImportedTransactions([]); setImportedFileNames([]); setAiEstimatedIncome(null);}} className="text-[11px] font-bold text-slate-500 hover:text-rose-600 underline">Clear all files</button>
+                      <span className="text-[11px] text-slate-400">Add more: just select again — we append & de-dupe</span>
+                    </div>
+                  )}
+                  {aiEstimatedIncome && (
+                    <div className="p-2.5 bg-sky-50 border border-sky-200 rounded-xl text-xs flex items-center justify-between">
+                      <div>
+                        <div className="font-bold text-sky-900">AI estimated your monthly income: {formatCurrency(aiEstimatedIncome, currencySymbol)}</div>
+                        <div className="text-[11px] text-sky-700">From {importedTransactions.filter(t=>t.type==='income').length} income entries. You can keep it or edit salary in previous step.</div>
+                      </div>
+                      <button type="button" onClick={()=>{setMonthlyIncomeStr(String(aiEstimatedIncome)); setCurrentStep(2);}} className="ml-2 px-3 py-1.5 bg-sky-600 text-white rounded-lg text-xs font-bold hover:bg-sky-700 shrink-0">Use this → Step 2</button>
+                    </div>
+                  )}
 
                   {/* Parsing loading state */}
                   {isParsingStatement && (
