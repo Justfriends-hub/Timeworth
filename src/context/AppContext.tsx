@@ -48,6 +48,7 @@ interface AppContextType {
   toggleDebtorStatus: (id: string) => Promise<void>;
   deleteDebtor: (id: string) => Promise<void>;
   completeOnboarding: (onboardingData: any) => Promise<void>;
+  ingestStatements: (transactions: any[]) => Promise<{ addedExpenses: number; addedIncome: number; total: number }>;
   resetData: () => Promise<void>;
   manualRefresh: () => Promise<void>;
   signOut: () => Promise<void>;
@@ -618,6 +619,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
+  const ingestStatements = async (transactions: any[]) => {
+    setIsSyncing(true);
+    try {
+      const res = await fetch('/api/statements/ingest', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ transactions }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to ingest statements');
+      if (data.store) {
+        setData(data.store);
+        try { localStorage.setItem(ONBOARDING_DATA_KEY, JSON.stringify(data.store)); } catch {}
+      } else {
+        await fetchData(false);
+      }
+      setLastSyncedAt(new Date());
+      setSyncCount(c => c+1);
+      return { addedExpenses: data.addedExpenses||0, addedIncome: data.addedIncome||0, total: data.total||0 };
+    } catch (e) {
+      console.error('ingestStatements failed', e);
+      throw e;
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   const resetData = async () => {
     setIsLoading(true);
     try {
@@ -695,6 +723,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         toggleDebtorStatus,
         deleteDebtor,
         completeOnboarding,
+        ingestStatements,
         resetData,
         manualRefresh,
         signOut,

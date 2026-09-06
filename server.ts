@@ -54,15 +54,18 @@ function getOpenRouterKey(): string | null {
 async function tryOpenRouterParse(fileData: string, mimeType: string | undefined, fileName: string | undefined): Promise<any[] | null> {
   const key = getOpenRouterKey();
   if (!key) return null;
-  const promptText = `You are a financial parsing expert. Analyze this bank statement document, CSV, or statement image.
-CRITICAL REQUIREMENTS:
-1. Extract ALL banking transactions.
-2. The statement may span MULTIPLE MONTHS. Inspect each transaction's date and file under correct 'YYYY-MM' month.
-3. For each transaction provide: "date" (YYYY-MM-DD), "amount" (positive number), "description", "type" ("expense" for debits / "income" for credits), "suggestedCategory" from ["Groceries","Business","Food & Drink","Transportation","Utilities","Education","Savings","Pets","Personal Care","Hobbies","Entertainment","Shopping","General"], "month" (YYYY-MM).
-4. Exclude summary/balance rows.
-Return ONLY a valid JSON array.`;
+  const promptText = `You are a financial parsing expert. Read this bank statement ROW BY ROW — every single row is a potential transaction, make no mistakes.
+
+ROW-BY-ROW RULES:
+1. Go through the document line by line, row by row. Extract EVERY transaction, none skipped.
+2. For XLS/CSV: each row with a date + description + amount is one transaction. Pay close attention to debit vs credit columns.
+3. The statement may span MULTIPLE MONTHS — inspect EACH transaction's date individually and set 'month' to that transaction's YYYY-MM.
+4. For each transaction provide: "date" (YYYY-MM-DD), "amount" (positive number), "description" (merchant/party), "type" ("expense" for debits/withdrawals or "income" for credits/deposits), "suggestedCategory" from ["Groceries","Business","Food & Drink","Transportation","Utilities","Education","Savings","Pets","Personal Care","Hobbies","Entertainment","Shopping","General"], "month" (YYYY-MM).
+5. Exclude only summary/balance/total rows and page headers.
+Return ONLY a valid JSON array — one object per row, in order.`;
 
   const isDataUri = fileData.startsWith('data:');
+  const isExcelFile = fileName?.toLowerCase().endsWith('.xls') || fileName?.toLowerCase().endsWith('.xlsx') || mimeType?.includes('spreadsheet') || mimeType?.includes('excel');
   let messages: any[];
   // Choose free vision-capable model when file is image/pdf, else fast text model
   const isVision = isDataUri && (mimeType?.includes('pdf') || mimeType?.includes('image') || fileName?.match(/\.(pdf|jpg|jpeg|png|webp)$/i));
@@ -79,8 +82,28 @@ Return ONLY a valid JSON array.`;
   } else {
     let textContent = fileData;
     if (isDataUri) {
-      const b64 = fileData.split(',')[1];
-      if (b64) try { textContent = Buffer.from(b64, 'base64').toString('utf-8'); } catch {}
+      const commaIdx = fileData.indexOf(',');
+      const b64raw = commaIdx !== -1 ? fileData.slice(commaIdx+1).replace(/\s/g,'') : '';
+      if (isExcelFile && b64raw.length > 100) {
+        // XLS/XLSX is binary — convert row-by-row to CSV text so AI can read each row accurately
+        try {
+          const buffer = Buffer.from(b64raw, 'base64');
+          const wb = XLSX.read(buffer, { type: 'buffer' });
+          const sheet = wb.Sheets[wb.SheetNames[0]];
+          // Convert sheet row-by-row to CSV text (preserves each row exactly)
+          const csvText = XLSX.utils.sheet_to_csv(sheet);
+          if (csvText && csvText.trim().length > 20) {
+            textContent = 'EXCEL STATEMENT (converted row-by-row to CSV for AI parsing):\n' + csvText;
+          } else {
+            // fallback to formatted rows
+            const rows:any[][] = XLSX.utils.sheet_to_json(sheet, { header:1, defval:'' });
+            textContent = rows.map(r=>r.join(',')).join('\n');
+          }
+        } catch (e) { try { textContent = Buffer.from(b64raw, 'base64').toString('utf-8'); } catch {} }
+      } else {
+        const b64 = fileData.split(',')[1];
+        if (b64) try { textContent = Buffer.from(b64.replace(/\s/g,''), 'base64').toString('utf-8'); } catch {}
+      }
     }
     // Truncate huge statements to stay under token limit
     if (textContent.length > 120000) textContent = textContent.slice(0, 120000);
@@ -639,58 +662,26 @@ export function createApp(): express.Express {
       const isPdf = mimeType?.includes('pdf') || fileName?.toLowerCase().endsWith('.pdf');
       const geminiAvailable = !!ai;
 
-      // --- FAST LOCAL XLS/XLSX path (no AI needed) - avoids pattern errors for Excel ---
-      if (isExcel) {
+      // XLS/XLSX is now handled by OpenRouter row-by-row AI above (see tryOpenRouterParse).
+      // If AI was not available or returned 0, fall back to local SheetJS (keeps all rows, categories default to Groceries)
+      if (isExcel && fileData.startsWith('data:')) {
         try {
-          const commaIdx = fileData.indexOf(',');
-          let base64 = commaIdx !== -1 ? fileData.slice(commaIdx + 1) : fileData;
-          base64 = base64.replace(/\s/g, '');
-          // if fileData was read as text (rare), base64 will be the text itself - detect and skip
-          if (fileData.startsWith('data:') && base64.length > 100) {
-            const buffer = Buffer.from(base64, 'base64');
-            const wb = XLSX.read(buffer, { type: 'buffer' });
-            const sheetName = wb.SheetNames[0];
-            const sheet = wb.Sheets[sheetName];
-            const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
-            let headerIdx = 0;
-            for (let i=0;i<Math.min(5, rows.length);i++) {
-              const joined = rows[i].join(' ').toLowerCase();
-              if (joined.includes('date') && (joined.includes('amount') || joined.includes('debit') || joined.includes('credit'))) { headerIdx = i; break; }
-            }
-            const excelTxs: any[] = [];
-            for (let i=headerIdx+1; i<rows.length; i++) {
-              const r = rows[i];
-              if (!r || r.length < 2) continue;
-              const dateRaw = String(r[0]||'').trim();
-              const desc = String(r[1]|| r[2] || 'Transaction').trim();
-              let amountRaw: number | null = null;
-              for (let c=2;c<Math.min(7, r.length);c++) {
-                const v = String(r[c]).replace(/[^0-9.\-]/g,'');
-                const n = parseFloat(v);
-                if (!isNaN(n) && n!==0 && Math.abs(n) > 0.5) { amountRaw = n; break; }
-              }
-              if (amountRaw===null || isNaN(amountRaw) || amountRaw===0) continue;
-              const absAmt = Math.abs(amountRaw);
-              let dateFormatted = new Date().toISOString().split('T')[0];
-              if (typeof r[0] === 'number' && r[0] > 30000) {
-                const excelDate = new Date((r[0] - 25569) * 86400 * 1000);
-                if (!isNaN(excelDate.getTime())) dateFormatted = excelDate.toISOString().split('T')[0];
-              } else {
-                const parsed = new Date(dateRaw);
-                if (!isNaN(parsed.getTime()) && dateRaw.length >= 6) dateFormatted = parsed.toISOString().split('T')[0];
-              }
-              excelTxs.push({
-                id: `parsed-xls-${Date.now()}-${i}`, date: dateFormatted, amount: absAmt, description: desc.slice(0,60),
-                type: amountRaw < 0 ? 'expense' : (String(r[3]||'').toLowerCase().includes('debit') ? 'expense' : 'income'), suggestedCategory: 'Groceries', month: dateFormatted.slice(0,7), isDuplicate: false, confirmed: true,
-              });
-            }
-            if (excelTxs.length > 0) {
-              return res.json({ success: true, transactions: excelTxs, method: 'local-xlsx-fallback', geminiAvailable, warning: geminiAvailable ? undefined : 'Parsed locally from Excel without AI (no GEMINI_API_KEY). For better categorization, add GEMINI_API_KEY.' });
+          const commaIdxL = fileData.indexOf(',');
+          let b64L = commaIdxL !== -1 ? fileData.slice(commaIdxL+1).replace(/\s/g,'') : '';
+          if (b64L.length > 50) {
+            const bufferL = Buffer.from(b64L, 'base64');
+            const wbL = XLSX.read(bufferL, { type: 'buffer' });
+            const sheetL = wbL.Sheets[wbL.SheetNames[0]];
+            const rowsL:any[][] = XLSX.utils.sheet_to_json(sheetL, { header:1, defval:'' });
+            let headerIdxL=0;
+            for(let i=0;i<Math.min(5,rowsL.length);i++){const j=rowsL[i].join(' ').toLowerCase();if(j.includes('date')&&(j.includes('amount')||j.includes('debit')||j.includes('credit'))){headerIdxL=i;break;}}
+            const excelTxsL:any[]=[];
+            for(let i=headerIdxL+1;i<rowsL.length;i++){const r=rowsL[i];if(!r||r.length<2)continue;const dr=String(r[0]||'').trim();const desc=String(r[1]||r[2]||'Transaction').trim();let av:number|null=null;for(let c=2;c<Math.min(7,r.length);c++){const s=String(r[c]).replace(/[^0-9.-]/g,'');const n=parseFloat(s);if(!isNaN(n)&&n!==0&&Math.abs(n)>0.5){av=n;break;}}if(av===null||isNaN(av)||av===0)continue;const abs=Math.abs(av);let ds=new Date().toISOString().split('T')[0];if(typeof r[0]==='number'&&r[0]>30000){const d=new Date((r[0]-25569)*86400*1000);if(!isNaN(d.getTime()))ds=d.toISOString().split('T')[0];}else{const d=new Date(dr);if(!isNaN(d.getTime())&&dr.length>=6)ds=d.toISOString().split('T')[0];}excelTxsL.push({id:`parsed-xls-${Date.now()}-${i}`,date:ds,amount:abs,description:desc.slice(0,60),type:av<0?'expense':'income',suggestedCategory:'Groceries',month:ds.slice(0,7),isDuplicate:false,confirmed:true});}
+            if(excelTxsL.length>0){
+              return res.json({ success:true, transactions:excelTxsL, method:'local-xlsx-fallback', geminiAvailable, warning: geminiAvailable?undefined:'Parsed locally from Excel without AI. Add GEMINI_API_KEY or OPENROUTER_API_KEY for AI row-by-row categorization.' });
             }
           }
-        } catch (xlsErr: any) {
-          console.warn('[xlsx local] failed, will try AI:', xlsErr?.message);
-        }
+        } catch(e:any){ console.warn('[xlsx local fallback after AI] failed',e?.message); }
       }
 
       if (ai) {
@@ -707,20 +698,21 @@ export function createApp(): express.Express {
               contentsPart = { inlineData: { mimeType: detectedMime || 'application/pdf', data: b64 } };
             } else { contentsPart = { text: fileData }; }
           } else { contentsPart = { text: fileData }; }
-          const promptText = `You are a financial parsing expert. Analyze this bank statement document, CSV, or statement image.
-CRITICAL REQUIREMENTS:
-1. Extract ALL banking transactions.
-2. The statement may span MULTIPLE MONTHS or multiple years. You MUST inspect each individual transaction's date (e.g. 2024-03-15, 2024-04-02) and file that transaction under its own correct month in 'YYYY-MM' format (e.g. '2024-03', '2024-04'), NEVER assuming one single month for the whole document.
-3. For each transaction, provide:
-   - "date": string formatted strictly as "YYYY-MM-DD"
+          const promptText = `You are a financial parsing expert. Read this bank statement ROW BY ROW — be meticulous, every row matters.
+
+CRITICAL ROW-BY-ROW REQUIREMENTS:
+1. Go line by line, row by row. Extract EVERY banking transaction — make no mistakes, none skipped, none invented.
+2. For XLS/CSV: each data row with a date + description + amount is one transaction. Carefully distinguish debit vs credit columns.
+3. The statement may span MULTIPLE MONTHS or years. For EACH transaction, inspect its individual date (e.g. 2024-03-15, 2024-04-02) and set 'month' to that transaction's YYYY-MM, never one month for the whole doc.
+4. For each transaction, provide:
+   - "date": string strictly "YYYY-MM-DD"
    - "amount": positive number
-   - "description": clear merchant or party description
-   - "type": "expense" for debits/withdrawals/payments, or "income" for credits/deposits
-   - "suggestedCategory": choose the most relevant from:
-     ["Groceries", "Business", "Food & Drink", "Transportation", "Utilities", "Education", "Savings", "Pets", "Personal Care", "Hobbies", "Entertainment", "Shopping", "General"]
-   - "month": string strictly in "YYYY-MM" format corresponding to the date of that specific transaction.
-4. Exclude account summary lines, opening/closing balance rows, fees totals, or page headers.
-Return ONLY a valid JSON array of these transaction objects.`;
+   - "description": clear merchant/party description
+   - "type": "expense" for debits/withdrawals/payments, "income" for credits/deposits
+   - "suggestedCategory": most relevant from ["Groceries","Business","Food & Drink","Transportation","Utilities","Education","Savings","Pets","Personal Care","Hobbies","Entertainment","Shopping","General"]
+   - "month": strictly "YYYY-MM" for that transaction's date
+5. Exclude only account summary, opening/closing balance, fees totals, or page headers.
+Return ONLY a valid JSON array — one object per row, in original order.`;
           const response = await ai.models.generateContent({
             model: 'gemini-2.0-flash',
             contents: { parts: [contentsPart, { text: promptText }] },
@@ -811,6 +803,64 @@ Return ONLY a valid JSON array of these transaction objects.`;
       console.error('Error parsing statement:', err);
       res.status(500).json({ error: err.message || 'Failed to parse statement' });
     }
+  });
+
+  // 14b. Ingest statement transactions post-onboarding (Settings re-upload)
+  // Called from Settings when user re-uploads a statement after onboarding.
+  // Body: { transactions: ParsedTransaction[] } -> adds to expenses/income + categories analytics
+  app.post('/api/statements/ingest', async (req, res) => {
+    const { transactions } = req.body;
+    if (!Array.isArray(transactions) || transactions.length === 0) {
+      return res.status(400).json({ error: 'transactions array is required' });
+    }
+    let addedExpenses = 0;
+    let addedIncome = 0;
+    const userId = (req.headers['x-user-id'] as string) || null;
+    const sb = getSupabaseServer();
+    for (const tr of transactions) {
+      const amt = Math.abs(Number(tr.amount || 0));
+      if (amt <= 0) continue;
+      const matchedCat = store.categories.find(c => c.name.toLowerCase() === (tr.suggestedCategory || '').toLowerCase()) || store.categories[0];
+      if (!matchedCat) continue;
+      if (tr.type === 'expense') {
+        const exp: ExpenseEntry = {
+          id: `exp-ingest-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+          amount: amt,
+          title: tr.description || 'Statement Expense',
+          categoryId: matchedCat.id,
+          dateTime: tr.date ? new Date(tr.date).toISOString() : new Date().toISOString(),
+          note: `Imported from statement (${tr.month || ''}) via Settings`,
+        };
+        store.expenses.unshift(exp);
+        matchedCat.spent += amt;
+        addedExpenses++;
+        if (sb && userId) {
+          try { await sb.from('expenses').insert({ user_id: userId, amount: amt, title: exp.title, category_id: exp.categoryId, date_time: exp.dateTime, note: exp.note }); } catch {}
+        }
+      } else {
+        const inc: IncomeEntry = {
+          id: `inc-ingest-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+          amount: amt,
+          source: tr.description || 'Statement Credit',
+          category: tr.suggestedCategory || 'Deposit',
+          dateTime: tr.date ? new Date(tr.date).toISOString() : new Date().toISOString(),
+          note: `Imported from statement (${tr.month || ''}) via Settings`,
+        };
+        store.income.unshift(inc);
+        addedIncome++;
+        if (sb && userId) {
+          try { await sb.from('income').insert({ user_id: userId, amount: amt, source: inc.source, category: inc.category, date_time: inc.dateTime, note: inc.note }); } catch {}
+        }
+      }
+    }
+    store.lastUpdated = new Date().toISOString();
+    // Also persist category spent updates if Supabase
+    if (sb && userId) {
+      for (const cat of store.categories) {
+        try { await sb.from('categories').update({ spent: cat.spent }).eq('user_id', userId).eq('id', cat.id); } catch {}
+      }
+    }
+    res.json({ success: true, addedExpenses, addedIncome, total: addedExpenses+addedIncome, store });
   });
 
   // 15. Update Category budget
