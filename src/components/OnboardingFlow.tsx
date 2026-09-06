@@ -199,8 +199,9 @@ export const OnboardingFlow: React.FC = () => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result as string);
       reader.onerror = () => reject(new Error('Failed to read ' + file.name));
-      if (file.name.endsWith('.csv') || file.type.includes('csv')) reader.readAsText(file);
-      else reader.readAsDataURL(file);
+      const name = file.name.toLowerCase();
+      if (name.endsWith('.csv') || file.type.includes('csv')) reader.readAsText(file);
+      else reader.readAsDataURL(file); // PDF, XLS/XLSX, images -> base64 for Gemini
     });
 
     try {
@@ -948,11 +949,11 @@ export const OnboardingFlow: React.FC = () => {
                       {importedFileNames.length > 0 ? `${importedFileNames.length} file(s): ${importedFileNames.join(', ').slice(0,80)}${importedFileNames.join(', ').length>80?'...':''}` : 'Click to select or drop MULTIPLE statement files'}
                     </span>
                     <span className="text-[11px] text-slate-400 mt-0.5 text-center">
-                      PDF, CSV, JPG, PNG — select many at once. AI extracts & merges all, auto-estimates salary.
+                      PDF, CSV, XLS/XLSX, JPG, PNG — select many at once. AI extracts & merges all, auto-estimates salary.
                     </span>
                     <input
                       type="file"
-                      accept=".pdf,.csv,image/*"
+                      accept=".pdf,.csv,.xls,.xlsx,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,image/*"
                       multiple
                       onChange={handleFileUpload}
                       className="hidden"

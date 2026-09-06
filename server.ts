@@ -3,6 +3,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
+import * as XLSX from 'xlsx';
 import { initialDataPayload } from './src/data/defaultData';
 import type { AppDataPayload, BankAccount, Debtor, ExpenseEntry, Goal, IncomeEntry, UserProfile } from './src/types';
 import { calculateHourlyRate } from './src/utils/timeConversion';
@@ -34,7 +35,6 @@ let store: AppDataPayload = JSON.parse(JSON.stringify(initialDataPayload));
 let genAIClient: GoogleGenAI | null = null;
 function getGenAI(): GoogleGenAI | null {
   if (!process.env.GEMINI_API_KEY) {
-    console.warn('[gemini] GEMINI_API_KEY not set - AI parsing disabled, using CSV fallback only');
     return null;
   }
   if (!genAIClient) {
@@ -44,6 +44,102 @@ function getGenAI(): GoogleGenAI | null {
     });
   }
   return genAIClient;
+}
+
+function getOpenRouterKey(): string | null {
+  return process.env.OPENROUTER_API_KEY || process.env.OPEN_ROUTER_API_KEY || null;
+}
+
+async function tryOpenRouterParse(fileData: string, mimeType: string | undefined, fileName: string | undefined): Promise<any[] | null> {
+  const key = getOpenRouterKey();
+  if (!key) return null;
+  const promptText = `You are a financial parsing expert. Analyze this bank statement document, CSV, or statement image.
+CRITICAL REQUIREMENTS:
+1. Extract ALL banking transactions.
+2. The statement may span MULTIPLE MONTHS. Inspect each transaction's date and file under correct 'YYYY-MM' month.
+3. For each transaction provide: "date" (YYYY-MM-DD), "amount" (positive number), "description", "type" ("expense" for debits / "income" for credits), "suggestedCategory" from ["Groceries","Business","Food & Drink","Transportation","Utilities","Education","Savings","Pets","Personal Care","Hobbies","Entertainment","Shopping","General"], "month" (YYYY-MM).
+4. Exclude summary/balance rows.
+Return ONLY a valid JSON array.`;
+
+  const isDataUri = fileData.startsWith('data:');
+  let messages: any[];
+  // Choose free vision-capable model when file is image/pdf, else fast text model
+  const isVision = isDataUri && (mimeType?.includes('pdf') || mimeType?.includes('image') || fileName?.match(/\.(pdf|jpg|jpeg|png|webp)$/i));
+  const model = isVision ? 'qwen/qwen-2.5-vl-32b-instruct:free' : 'mistralai/mistral-7b-instruct:free';
+
+  if (isVision) {
+    messages = [{
+      role: 'user',
+      content: [
+        { type: 'text', text: promptText },
+        { type: 'image_url', image_url: { url: fileData } }
+      ]
+    }];
+  } else {
+    let textContent = fileData;
+    if (isDataUri) {
+      const b64 = fileData.split(',')[1];
+      if (b64) try { textContent = Buffer.from(b64, 'base64').toString('utf-8'); } catch {}
+    }
+    // Truncate huge statements to stay under token limit
+    if (textContent.length > 120000) textContent = textContent.slice(0, 120000);
+    messages = [
+      { role: 'system', content: 'You are a financial parsing expert. Return ONLY JSON array.' },
+      { role: 'user', content: promptText + '\n\nSTATEMENT DATA:\n' + textContent }
+    ];
+  }
+
+  try {
+    const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': process.env.APP_URL || 'http://localhost:3000',
+        'X-Title': 'TimeWorth',
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        response_format: { type: 'json_object' },
+        temperature: 0.1,
+        max_tokens: 4000,
+      }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      console.warn('[openrouter] non-ok', resp.status, txt.slice(0,500));
+      // try fallback text model if vision model failed
+      if (isVision && resp.status === 400) {
+        // retry as text extraction
+        let textContent = fileData;
+        if (isDataUri) {
+          const b64 = fileData.split(',')[1];
+          if (b64) try { textContent = Buffer.from(b64, 'base64').toString('utf-8').slice(0,80000); } catch {}
+        }
+        return null;
+      }
+      return null;
+    }
+    const j: any = await resp.json();
+    const content: string = j.choices?.[0]?.message?.content || '';
+    if (!content) return null;
+    // Extract JSON array from content (may be wrapped in ```json or object)
+    let parsed: any;
+    try { parsed = JSON.parse(content); } catch {
+      const m = content.match(/\[[\s\S]*\]/);
+      if (m) parsed = JSON.parse(m[0]);
+      else return null;
+    }
+    // OpenRouter may return { transactions: [...] } or plain array
+    if (!Array.isArray(parsed) && Array.isArray(parsed.transactions)) parsed = parsed.transactions;
+    if (!Array.isArray(parsed) && Array.isArray(parsed.data)) parsed = parsed.data;
+    if (!Array.isArray(parsed)) return null;
+    return parsed;
+  } catch (e: any) {
+    console.warn('[openrouter] parse failed:', e?.message || e);
+    return null;
+  }
 }
 
 // ── Express app factory — exported for Vercel serverless ──
@@ -68,6 +164,7 @@ export function createApp(): express.Express {
       time: new Date().toISOString(),
       supabase: isSupabaseConfigured() ? 'configured' : 'demo-memory',
       gemini: !!process.env.GEMINI_API_KEY,
+      openrouter: !!getOpenRouterKey(),
       env: process.env.VERCEL ? 'vercel' : 'local',
     });
   });
@@ -586,16 +683,82 @@ Return ONLY a valid JSON array of these transaction objects.`;
           });
           return res.json({ success: true, transactions: enriched, method: 'gemini-2.0-flash', geminiAvailable: true });
         } catch (geminiErr: any) { 
-          console.warn('Gemini API parse failed, checking fallback:', geminiErr?.message || geminiErr);
-          // Return the actual gemini error to client so UI can show it
-          if (String(geminiErr?.message || '').includes('API_KEY') || String(geminiErr?.message || '').includes('not found')) {
-            return res.status(502).json({ error: 'Gemini AI error: ' + (geminiErr?.message || 'API key invalid'), geminiAvailable: false, method: 'gemini-error' });
-          }
+          console.warn('Gemini API parse failed, trying OpenRouter fallback:', geminiErr?.message || geminiErr);
+          // don't return yet — try OpenRouter before failing
         }
       }
-      // No Gemini or Gemini failed -> CSV fallback (only works for real CSV text)
-      if (!isCsv && !geminiAvailable) {
-        return res.json({ success: true, transactions: [], method: 'no-gemini-no-csv', geminiAvailable: false, warning: 'AI is not configured (GEMINI_API_KEY missing). PDF/Image parsing requires Gemini. Only CSV can be parsed without it. Add GEMINI_API_KEY in .env or Vercel env.' });
+      // Try FREE OpenRouter fallback (auto-chooses free model) if Gemini not available or failed
+      {
+        const openRouterTxs = await tryOpenRouterParse(fileData, mimeType, fileName);
+        if (openRouterTxs && openRouterTxs.length > 0) {
+          const existingList: any[] = Array.isArray(existingTransactions) ? existingTransactions : [...store.expenses, ...store.income];
+          const enriched = openRouterTxs.map((tx: any, idx: number) => {
+            const isDup = existingList.some(ex => {
+              const exDate = (ex.dateTime || ex.date || '').slice(0, 10);
+              const txDate = (tx.date || '').slice(0, 10);
+              return exDate === txDate && Math.abs(Math.abs(ex.amount || 0) - Math.abs(tx.amount || 0)) < 0.01;
+            });
+            return { id: `parsed-or-${Date.now()}-${idx}`, date: tx.date, amount: Math.abs(Number(tx.amount)||0), description: tx.description || 'Transaction', type: (tx.type==='income'?'income':'expense'), suggestedCategory: tx.suggestedCategory || 'Groceries', month: tx.month || (tx.date||'').slice(0,7), isDuplicate: isDup, confirmed: !isDup };
+          });
+          return res.json({ success: true, transactions: enriched, method: 'openrouter-free', geminiAvailable, openrouter: true });
+        }
+      }
+      // No Gemini or Gemini+OpenRouter failed -> try local fallbacks (CSV + XLS/XLSX without AI)
+      const isExcel = fileName?.toLowerCase().endsWith('.xls') || fileName?.toLowerCase().endsWith('.xlsx') || mimeType?.includes('spreadsheet') || mimeType?.includes('excel');
+      if (isExcel && fileData.startsWith('data:')) {
+        try {
+          const base64 = fileData.split(',')[1];
+          const buffer = Buffer.from(base64, 'base64');
+          const wb = XLSX.read(buffer, { type: 'buffer' });
+          const sheetName = wb.SheetNames[0];
+          const sheet = wb.Sheets[sheetName];
+          const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+          // Heuristic: find header row with date/description/amount
+          let headerIdx = 0;
+          for (let i=0;i<Math.min(5, rows.length);i++) {
+            const joined = rows[i].join(' ').toLowerCase();
+            if (joined.includes('date') && (joined.includes('amount') || joined.includes('debit') || joined.includes('credit'))) { headerIdx = i; break; }
+          }
+          const excelTxs: any[] = [];
+          for (let i=headerIdx+1; i<rows.length; i++) {
+            const r = rows[i];
+            if (!r || r.length < 2) continue;
+            // Try to find date in col 0, desc in col 1, amount in col 2 or 3/4
+            const dateRaw = String(r[0]||'').trim();
+            const desc = String(r[1]|| r[2] || 'Transaction').trim();
+            // search amount: first numeric with maybe comma in col 2..5
+            let amountRaw: number | null = null;
+            for (let c=2;c<Math.min(7, r.length);c++) {
+              const v = String(r[c]).replace(/[^0-9.\-]/g,'');
+              const n = parseFloat(v);
+              if (!isNaN(n) && n!==0 && Math.abs(n) > 0.5) { amountRaw = n; break; }
+            }
+            if (amountRaw===null || isNaN(amountRaw) || amountRaw===0) continue;
+            const absAmt = Math.abs(amountRaw);
+            let dateFormatted = new Date().toISOString().split('T')[0];
+            // Excel date may be a number (serial) or string
+            if (typeof r[0] === 'number' && r[0] > 30000) {
+              // Excel serial date
+              const excelDate = new Date((r[0] - 25569) * 86400 * 1000);
+              if (!isNaN(excelDate.getTime())) dateFormatted = excelDate.toISOString().split('T')[0];
+            } else {
+              const parsed = new Date(dateRaw);
+              if (!isNaN(parsed.getTime()) && dateRaw.length >= 6) dateFormatted = parsed.toISOString().split('T')[0];
+            }
+            excelTxs.push({
+              id: `parsed-xls-${Date.now()}-${i}`, date: dateFormatted, amount: absAmt, description: desc.slice(0,60),
+              type: amountRaw < 0 ? 'expense' : (String(r[3]||'').toLowerCase().includes('debit') ? 'expense' : 'income'), suggestedCategory: 'Groceries', month: dateFormatted.slice(0,7), isDuplicate: false, confirmed: true,
+            });
+          }
+          if (excelTxs.length > 0) {
+            return res.json({ success: true, transactions: excelTxs, method: 'local-xlsx-fallback', geminiAvailable, warning: geminiAvailable ? undefined : 'Parsed locally from Excel without AI (no GEMINI_API_KEY). For better categorization, add GEMINI_API_KEY.' });
+          }
+        } catch (xlsErr: any) {
+          console.warn('[xlsx fallback] failed:', xlsErr?.message);
+        }
+      }
+      if (!isCsv && !isExcel && !geminiAvailable) {
+        return res.json({ success: true, transactions: [], method: 'no-gemini-no-csv', geminiAvailable: false, warning: 'AI is not configured (GEMINI_API_KEY missing). PDF/Image/XLS parsing needs Gemini for best results, but CSV and XLS are parsed locally. Add GEMINI_API_KEY in .env or Vercel env for better AI categorization.' });
       }
       let textContent = fileData;
       if (fileData.startsWith('data:')) {
